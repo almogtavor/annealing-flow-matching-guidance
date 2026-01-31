@@ -1,1 +1,83 @@
+# Python environments
 venv/
+env/
+.venv/
+
+conda_pkgs/
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments (conda)
+*/site-packages/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# PyTorch & ML artifacts
+output/
+outputs/
+results/
+logs/
+*.pth
+*.pt
+*.bin
+*.ckpt
+checkpoint*/
+model_*.pt
+
+# Data (local datasets)
+data/
+*.parquet
+*.csv
+*.jsonl
+src/data/laion/laion_top20k_images/
+
+# Hugging Face cache
+.cache/
+*.cache
+
+# Wandb
+wandb/
+.wandb/
+
+# Temp/build files
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# SLURM logs
+slurm_*.out
+slurm_*.err
+
+# Experiment artifacts
+tb/
+tensorboard_runs/
+.wandb/
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Environment files (don't commit secrets)
+.env
+.env.local

@@ -1,5 +1,12 @@
 import os
+import sys
 import torch
+
+# Allow running as `python scripts/sample.py` from anywhere.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import src.utils.model_utils as model_utils
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'

@@ -1,3 +1,4 @@
+import os
 import torch
 
 from src.schedulers.my_scheduling_ddim import MyDDIMScheduler
@@ -31,6 +32,8 @@ def load_models(checkpoint_path=None, config_path=None, device=None):
     return config, pipeline, guidance_scale_network
 
 def get_dtype(config):
+    if os.environ.get("ANNEALING_GUIDANCE_FORCE_FP16", "0") == "1":
+        return torch.float16
     dtype = torch.float16 if config.get('low_memory', True) else torch.float32
     return dtype
 
@@ -64,6 +67,10 @@ def load_pipeline(config, device=None, dtype=None):
         config['diffusion']['model_id'], scheduler=scheduler, torch_dtype=dtype)
 
     pipeline.to(device)
+
+    # Reduce memory usage (especially helpful on 16GB-class GPUs)
+    if hasattr(pipeline, "enable_attention_slicing"):
+        pipeline.enable_attention_slicing()
     
 
     # pipeline.enable_xformers_memory_efficient_attention()

@@ -211,7 +211,7 @@ dependencies:
       - cycler==0.12.1
       - dataclasses==0.6
       - debugpy==1.8.16
-      - diffusers==0.34.0
+      - diffusers==0.36.0
       - exifread-nocycle==3.0.1
       - filelock==3.18.0
       - fire==0.7.1

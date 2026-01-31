@@ -1,7 +1,6 @@
 import os
 import torch
 from torch.utils.data import DataLoader
-import torch
 from src.data.dataset import LaionDataset
 
 def get_data_loader(config):
@@ -17,7 +16,18 @@ def get_data_loader(config):
     """
     # Dataset parameters
     batch_size = config["training"]["batch_size"]
-    image_root = config["training"]["image_root"]
+    image_root = os.environ.get("ANNEALING_GUIDANCE_IMAGE_ROOT") or config["training"]["image_root"]
+    image_root = os.path.expandvars(os.path.expanduser(str(image_root)))
+
+    if not os.path.isdir(image_root):
+        raise FileNotFoundError(
+            "Training dataset folder does not exist. "
+            f"image_root={image_root!r}. "
+            "Either create it (with shards of .jpg/.txt pairs) or override via env var: "
+            "ANNEALING_GUIDANCE_IMAGE_ROOT=/path/to/images"
+        )
+
+    print(f"Using training image_root: {image_root}", flush=True)
     dataset = LaionDataset(image_root)
 
     # Create DataLoader for training
@@ -164,21 +174,28 @@ def add_noise_to_prompt(y, gamma, noise_scale, psi, rescale=False):
     psi (float): Rescaling factor
     rescale (bool): Rescale the condition
     """
-    eps = 1e-6 
-    noise = torch.randn_like(y)
-    gamma = gamma.view(-1, *[1]*(y.ndim-1))
-    y_noised = torch.sqrt(gamma) * y + noise_scale * torch.sqrt(1 - gamma) * noise
+    eps = 1e-6
+
+    # Keep output dtype identical to input dtype (critical when UNet weights are fp16).
+    # Do math in fp32 for stability, then cast back.
+    y_dtype = y.dtype
+    y_f = y.float()
+    gamma_f = gamma.to(device=y.device, dtype=torch.float32).view(-1, *[1] * (y.ndim - 1))
+    noise_f = torch.randn_like(y_f)
+
+    y_noised_f = torch.sqrt(gamma_f) * y_f + noise_scale * torch.sqrt(1 - gamma_f) * noise_f
 
     if not rescale:
-        return y_noised
+        return y_noised_f.to(dtype=y_dtype)
 
     # per-sample mean/std (over all but batch dim if present)
     dims = tuple(range(1, y.ndim)) if y.ndim > 1 else ()
-    y_mean, y_std = y.mean(dims, keepdim=True), y.std(dims, keepdim=True) + eps
-    yn_mean, yn_std = y_noised.mean(dims, keepdim=True), y_noised.std(dims, keepdim=True) + eps
+    y_mean, y_std = y_f.mean(dims, keepdim=True), y_f.std(dims, keepdim=True) + eps
+    yn_mean, yn_std = y_noised_f.mean(dims, keepdim=True), y_noised_f.std(dims, keepdim=True) + eps
 
-    y_scaled = (y_noised - yn_mean) / yn_std * y_std + y_mean
-    return psi * y_scaled + (1 - psi) * y_noised
+    y_scaled = (y_noised_f - yn_mean) / yn_std * y_std + y_mean
+    out = psi * y_scaled + (1 - psi) * y_noised_f
+    return out.to(dtype=y_dtype)
     
 def prompt_add_noise(
     prompt_embeds,

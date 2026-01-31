@@ -1,7 +1,16 @@
 import math
+import os
+import sys
+import time
 import torch
 import datetime
 import tqdm
+
+# Allow running as `python scripts/train.py` from anywhere.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import src.utils.model_utils as model_utils
 import src.utils.train_utils as train_utils
 
@@ -18,6 +27,7 @@ def train(config, pipeline, model, optimizer, dataloader):
     datetime_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     for epoch in range(max_epochs):
+        epoch_start = time.time()
         for batch in tqdm.tqdm(dataloader):
             model.train()
             prompts, images = batch
@@ -46,6 +56,13 @@ def train(config, pipeline, model, optimizer, dataloader):
 
         if train_end:
             break
+
+        # Single marker line between epochs for SLURM logs
+        epoch_seconds = time.time() - epoch_start
+        print(
+            f"Epoch {epoch + 1}/{max_epochs} finished in {epoch_seconds:.1f}s (global_step={global_step})",
+            flush=True,
+        )
 
 
 def forward_pass(
@@ -111,6 +128,7 @@ def forward_pass(
     # Find indices in the reversed array
     timestep_indices = torch.searchsorted(scheduler_timesteps_reversed, timestep, right=True) - 1
     valid_indices = (timestep_indices - 1) >= 0
+    delta_t_minus_one = torch.zeros_like(noisy_latents)
     if valid_indices.any():
         timestep_indices = timestep_indices[valid_indices]
         timestep_prev = scheduler_timesteps_reversed[timestep_indices - 1]
@@ -121,14 +139,34 @@ def forward_pass(
         with torch.no_grad():
             prompt_embeds, added_cond_kwargs = train_utils.encode_prompt(pipeline, prompt)
             
-        noise_pred_prev = train_utils.denoise_single_step(
-            pipeline,
-            pred_latents_prev,
-            prompt_embeds,  # Assuming prompt_embeds has a batch dimension
-            timestep_prev,
-            {k: v[valid_indices] if isinstance(v, torch.Tensor) and v.shape[0] == valid_indices.shape[0] else v
-            for k, v in added_cond_kwargs.items()},
-        )[0]
+        # IMPORTANT: By default we do NOT backprop through this second UNet call.
+        # Backprop here creates a very large autograd graph and commonly OOMs on <=16GB GPUs.
+        backprop_through_prev = os.environ.get("ANNEALING_GUIDANCE_BACKPROP_THROUGH_PREV", "0") == "1"
+        if not backprop_through_prev:
+            pred_latents_prev = pred_latents_prev.detach()
+
+        _kwargs = {
+            k: v[valid_indices] if isinstance(v, torch.Tensor) and v.shape[0] == valid_indices.shape[0] else v
+            for k, v in added_cond_kwargs.items()
+        }
+
+        if backprop_through_prev:
+            noise_pred_prev = train_utils.denoise_single_step(
+                pipeline,
+                pred_latents_prev,
+                prompt_embeds,
+                timestep_prev,
+                _kwargs,
+            )[0]
+        else:
+            with torch.no_grad():
+                noise_pred_prev = train_utils.denoise_single_step(
+                    pipeline,
+                    pred_latents_prev,
+                    prompt_embeds,
+                    timestep_prev,
+                    _kwargs,
+                )[0]
 
         noise_pred_uncond_prev, noise_pred_text_prev = noise_pred_prev.chunk(2, dim=0)
         delta_t_minus_one = noise_pred_uncond_prev - noise_pred_text_prev
@@ -139,14 +177,35 @@ def forward_pass(
     return loss
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+if torch.cuda.is_available():
+    props = torch.cuda.get_device_properties(0)
+    print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+    print(f"GPU total VRAM (GiB): {props.total_memory / (1024**3):.2f}", flush=True)
+
 config_path = 'scripts/config.yaml'
 config, pipeline, guidance_scale_network = model_utils.load_models(
     config_path=config_path,
     device=device,
 )
 
+# Optional overrides (useful for SLURM sanity-check runs)
+_env_max_steps = os.environ.get("ANNEALING_GUIDANCE_MAX_STEPS")
+if _env_max_steps:
+    config.setdefault("training", {})
+    config["training"]["max_steps"] = int(_env_max_steps)
+
+_env_save_interval = os.environ.get("ANNEALING_GUIDANCE_SAVE_INTERVAL")
+if _env_save_interval:
+    config.setdefault("training", {})
+    config["training"]["save_interval"] = int(_env_save_interval)
+
+print("Models/pipeline loaded; building optimizer and dataloader...", flush=True)
+
 optimizer = torch.optim.AdamW(guidance_scale_network.parameters(), **config['training']['optimizer_kwargs'])
 dataloader = train_utils.get_data_loader(config)
+
+print(f"Dataloader ready: {len(dataloader)} batches/epoch", flush=True)
 
 
 train(config, pipeline, guidance_scale_network, optimizer, dataloader)
