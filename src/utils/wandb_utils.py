@@ -202,16 +202,16 @@ def log_train(step, loss, model):
     # --- Guidance scale metrics (from forward hook) ---
     if hasattr(model, '_wb_last_w'):
         w = model._wb_last_w.float()
-        data["train/guidance_scale_mean"] = w.mean().item()
+        data["train/w"] = w.mean().item()
         if w.numel() > 1:
-            data["train/guidance_scale_min"] = w.min().item()
-            data["train/guidance_scale_max"] = w.max().item()
+            data["train/w_min"] = w.min().item()
+            data["train/w_max"] = w.max().item()
 
     if hasattr(model, '_wb_last_t'):
-        data["train/timestep_mean"] = model._wb_last_t.float().mean().item()
+        data["train/timestep"] = model._wb_last_t.float().mean().item()
 
     if hasattr(model, '_wb_last_lam'):
-        data["train/lambda_mean"] = model._wb_last_lam.float().mean().item()
+        data["train/lambda"] = model._wb_last_lam.float().mean().item()
 
     # --- GPU metrics ---
     if torch.cuda.is_available():
@@ -244,13 +244,14 @@ def log_train(step, loss, model):
     _last_step_time = now
     _run.log(data, step=step)
 
-    # Accumulate for the final guidance-scale-vs-timestep scatter plot
-    if hasattr(model, '_wb_last_w') and hasattr(model, '_wb_last_t'):
-        for t_v, w_v in zip(
+    # Accumulate for the final scatter plots (w vs timestep, w vs lambda)
+    if hasattr(model, '_wb_last_w') and hasattr(model, '_wb_last_t') and hasattr(model, '_wb_last_lam'):
+        for t_v, w_v, l_v in zip(
             model._wb_last_t.float().cpu().view(-1),
             model._wb_last_w.float().cpu().view(-1),
+            model._wb_last_lam.float().cpu().view(-1),
         ):
-            _train_guidance_data.append([step, t_v.item(), w_v.item()])
+            _train_guidance_data.append([step, t_v.item(), w_v.item(), l_v.item()])
 
 
 # ---------------------------------------------------------------------------
@@ -322,14 +323,18 @@ def _log_sample_summary():
 
 
 def _log_train_guidance_graph():
-    """Scatter plot: predicted guidance scale vs. timestep across all training steps."""
+    """Scatter plots: w vs timestep and w vs lambda across all training steps."""
     if not _train_guidance_data:
         return
-    table = wandb.Table(data=_train_guidance_data, columns=["step", "timestep", "guidance_scale"])
+    table = wandb.Table(data=_train_guidance_data, columns=["step", "timestep", "w", "lambda"])
     _run.log({
-        "charts/guidance_scale_vs_timestep": wandb.plot.scatter(
-            table, "timestep", "guidance_scale",
-            title="Guidance Scale vs Timestep (Training)",
+        "charts/w_vs_timestep": wandb.plot.scatter(
+            table, "timestep", "w",
+            title="Guidance Scale (w) vs Timestep",
+        ),
+        "charts/w_vs_lambda": wandb.plot.scatter(
+            table, "lambda", "w",
+            title="Guidance Scale (w) vs Lambda",
         ),
     })
 

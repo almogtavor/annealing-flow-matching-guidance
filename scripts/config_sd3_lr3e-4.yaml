@@ -31,14 +31,14 @@ training:
   max_steps: 20000
   batch_size: 1
   accumulation_steps: 16
-  out_dir: ./output
+  out_dir: ./output/lr_3e-4
   image_root: src/data/laion/laion_pop_images/
   optimizer_kwargs:
     weight_decay: 0.01
-    lr: 0.0001
+    lr: 0.0003
 
   prompt_noise:
-    add_noise: true # Whether to add noise to prompt embeddings during training
+    add_noise: true
     noise_scale: 0.025
     rescale: true
     psi: 1

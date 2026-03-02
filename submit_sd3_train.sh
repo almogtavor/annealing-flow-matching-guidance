@@ -139,4 +139,5 @@ if [[ ! -d "$DEFAULT_IMAGE_ROOT" ]]; then
 fi
 
 echo "Starting SD3 annealing guidance training..."
-"$PY" -u scripts/train_sd3.py
+echo "Config: ${ANNEALING_GUIDANCE_CONFIG:-scripts/config_sd3.yaml}"
+ANNEALING_GUIDANCE_CONFIG="${ANNEALING_GUIDANCE_CONFIG:-scripts/config_sd3.yaml}" "$PY" -u scripts/train.py

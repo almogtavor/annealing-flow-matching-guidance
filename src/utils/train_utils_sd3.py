@@ -1,213 +1,165 @@
-"""SD3-specific training utilities for annealing guidance."""
+"""SD3-specific training utilities for annealing guidance.
+
+Only contains functions that differ from the SDXL path.
+Shared functions (get_data_loader, save_model, get_timestep, linear_schedule,
+add_noise_to_prompt) are imported from train_utils.
+"""
 import os
+import sys
+import glob
+import subprocess
 import torch
-from torch.utils.data import DataLoader
-from src.data.dataset import LaionDataset
+from src.utils.train_utils import add_noise_to_prompt, linear_schedule, get_timestep
 
 
-def get_data_loader(config):
-    batch_size = config["training"]["batch_size"]
-    image_root = os.environ.get("ANNEALING_GUIDANCE_IMAGE_ROOT") or config["training"]["image_root"]
-    image_root = os.path.expandvars(os.path.expanduser(str(image_root)))
+def load_models(config, device):
+    """Load SD3 pipeline + guidance MLP for training."""
+    from src.pipelines.my_pipeline_stable_diffusion3 import MyStableDiffusion3Pipeline
+    from src.model.guidance_scale_model import ScalarMLP
 
-    if not os.path.isdir(image_root):
-        raise FileNotFoundError(
-            f"Training dataset folder does not exist. image_root={image_root!r}. "
-            "Set ANNEALING_GUIDANCE_IMAGE_ROOT=/path/to/images"
-        )
+    hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+    dtype = torch.float16 if config.get('low_memory', True) else torch.float32
 
-    print(f"Using training image_root: {image_root}", flush=True)
-    dataset = LaionDataset(image_root)
+    pipeline = MyStableDiffusion3Pipeline.from_pretrained(
+        config['diffusion']['model_id'], torch_dtype=dtype, token=hf_token)
+    pipeline.to(device)
+    if hasattr(pipeline, "enable_attention_slicing"):
+        pipeline.enable_attention_slicing()
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        generator=torch.manual_seed(config['seed']),
-        pin_memory=True
-    )
-    return dataloader
+    pipeline.transformer.requires_grad_(False)
+    pipeline.vae.requires_grad_(False)
+    for enc in [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3]:
+        if enc is not None:
+            enc.requires_grad_(False)
+    if hasattr(pipeline.transformer, 'enable_gradient_checkpointing'):
+        pipeline.transformer.enable_gradient_checkpointing()
 
-
-def save_model(config, guidance_scale_model, step, timestamp, final=False):
-    dict_to_save = {
-        'config': config,
-        'model_state_dict': guidance_scale_model.state_dict(),
-        'model_config': config.get('guidance_scale_model', {}),
-        'step': step,
-    }
-    out_dir = config['training']['out_dir']
-    checkpoint_dir = f'{out_dir}/checkpoints_sd3_{timestamp}'
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
-    if final:
-        checkpoint_path = f'{checkpoint_dir}/checkpoint_final.pt'
-    else:
-        checkpoint_path = f'{checkpoint_dir}/checkpoint_step_{step}.pt'
-
-    torch.save(dict_to_save, checkpoint_path)
-    return os.path.abspath(checkpoint_path)
-
-
-def get_timestep(pipeline, batch_size=1):
-    """Sample random timesteps for SD3 flow matching."""
-    n_timesteps = len(pipeline.scheduler.timesteps)
-    timesteps_indices = torch.randint(1, n_timesteps, size=[batch_size])
-    timesteps = pipeline.scheduler.timesteps[n_timesteps - 1 - timesteps_indices]
-    timesteps = timesteps.to(device=pipeline.device)
-    return timesteps
-
-
-def calc_loss(noise_pred, noise_gt, delta_t_minus_one, l):
-    # Compute loss in float32 to avoid overflow
-    noise_pred = noise_pred.float()
-    noise_gt = noise_gt.float()
-    delta_t_minus_one = delta_t_minus_one.float()
-    l = l.float()
-
-    loss = torch.tensor(0.0, device=noise_pred.device)
-
-    # epsilon loss
-    squared_errors = ((noise_pred - noise_gt) ** 2).mean(dim=[1, 2, 3])
-    eps_loss = ((1 - l) * squared_errors).mean()
-    loss += eps_loss
-
-    # delta loss
-    squared_errors = (delta_t_minus_one ** 2).mean(dim=[1, 2, 3])
-    diff_loss = (l * squared_errors).mean()
-    loss += diff_loss
-
-    return loss
+    model = ScalarMLP(**config['guidance_scale_model'])
+    model.to(device, dtype=torch.float32)
+    model.device, model.dtype = device, torch.float32
+    return pipeline, model
 
 
 def encode_prompt_sd3(pipeline, prompt):
-    """Encode prompts for SD3 (three text encoders)."""
-    device = pipeline.device
-    dtype = pipeline.transformer.dtype
-
-    (
-        prompt_embeds,
-        negative_prompt_embeds,
-        pooled_prompt_embeds,
-        negative_pooled_prompt_embeds,
-    ) = pipeline.encode_prompt(
-        prompt=prompt,
-        prompt_2=None,
-        prompt_3=None,
-        device=device,
-        num_images_per_prompt=1,
-        do_classifier_free_guidance=True,
-    )
-
-    # Concatenate for CFG
-    prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-    pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
-
-    prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
-    pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
-
-    return prompt_embeds, pooled_prompt_embeds
+    """Encode prompts using SD3's three text encoders."""
+    device, dtype = pipeline.device, pipeline.transformer.dtype
+    pe, npe, ppe, nppe = pipeline.encode_prompt(
+        prompt=prompt, prompt_2=None, prompt_3=None,
+        device=device, num_images_per_prompt=1, do_classifier_free_guidance=True)
+    prompt_embeds = torch.cat([npe, pe], dim=0).to(device=device, dtype=dtype)
+    pooled = torch.cat([nppe, ppe], dim=0).to(device=device, dtype=dtype)
+    return prompt_embeds, pooled
 
 
-def denoise_single_step_sd3(pipeline, latents, prompt_embeds, pooled_prompt_embeds, timestep):
-    """Single denoising step for SD3 transformer."""
-    timesteps = torch.cat([timestep] * 2)  # duplicate for uncond pred
-    latent_model_input = torch.cat([latents] * 2)
-
-    noise_pred = pipeline.transformer(
-        hidden_states=latent_model_input,
-        timestep=timesteps,
-        encoder_hidden_states=prompt_embeds,
-        pooled_projections=pooled_prompt_embeds,
-        return_dict=False,
-    )[0]
-
-    return noise_pred
+def denoise_single_step_sd3(pipeline, latents, prompt_embeds, pooled, timestep):
+    """Single SD3 transformer forward (uncond + cond)."""
+    return pipeline.transformer(
+        hidden_states=torch.cat([latents] * 2), timestep=torch.cat([timestep] * 2),
+        encoder_hidden_states=prompt_embeds, pooled_projections=pooled,
+        return_dict=False)[0]
 
 
 def to_noisy_latents_sd3(pipeline, image, timestep, size=(1024, 1024)):
-    """Encode image to latent and add noise for SD3 (flow matching).
-
-    Returns (noisy_latents, velocity_gt) where velocity_gt = noise - clean_latents.
-    SD3 uses flow matching: z_t = (1-sigma)*x_0 + sigma*epsilon, and the model
-    predicts velocity v = epsilon - x_0.  The correct training target for the
-    guidance scale MLP is therefore this velocity, NOT the raw noise.
-    """
+    """VAE encode + flow-matching noise. Returns (noisy_latents, velocity_gt)."""
     with torch.no_grad():
         vae = pipeline.vae.to(torch.float32)
         image = image.to(device=vae.device, dtype=vae.dtype)
         image = torch.nn.functional.interpolate(image, size=size, mode='bilinear')
         latents = vae.encode(image).latent_dist.sample(generator=None)
-        # SD3 uses different scaling
-        latents = (latents - pipeline.vae.config.shift_factor) * pipeline.vae.config.scaling_factor
-
-    target_dtype = pipeline.transformer.dtype
-    latents = latents.to(dtype=target_dtype)
+        latents = (latents - vae.config.shift_factor) * vae.config.scaling_factor
+    dt = pipeline.transformer.dtype
+    latents = latents.to(dtype=dt)
     noise = torch.randn_like(latents)
-
-    # SD3 uses flow matching - compute sigma from timestep
-    # For flow matching: noisy = (1 - sigma) * x + sigma * noise
-    # where sigma = timestep / 1000 (timesteps are in [0, 1000] range)
-    sigma = (timestep.float() / 1000.0).to(dtype=target_dtype, device=latents.device)
-    sigma = sigma.view(-1, 1, 1, 1)  # broadcast for batch
+    sigma = (timestep.float() / 1000.0).to(dtype=dt, device=latents.device).view(-1, 1, 1, 1)
     noisy_latents = (1 - sigma) * latents + sigma * noise
-
-    # Flow matching velocity target: v = epsilon - x_0
-    velocity_gt = noise - latents
-
-    return noisy_latents, velocity_gt
+    return noisy_latents, noise - latents  # (z_t, v_gt = eps - x_0)
 
 
-def linear_schedule(t: torch.Tensor, tau1: float, tau2: float) -> torch.Tensor:
-    gamma = (tau2 - t) / (tau2 - tau1)
-    gamma = torch.clamp(gamma, min=0.0, max=1.0)
-    return gamma
-
-
-def add_noise_to_prompt(y, gamma, noise_scale, psi, rescale=False):
-    eps = 1e-6
-    y_dtype = y.dtype
-    y_f = y.float()
-    gamma_f = gamma.to(device=y.device, dtype=torch.float32).view(-1, *[1] * (y.ndim - 1))
-    noise_f = torch.randn_like(y_f)
-
-    y_noised_f = torch.sqrt(gamma_f) * y_f + noise_scale * torch.sqrt(1 - gamma_f) * noise_f
-
-    if not rescale:
-        return y_noised_f.to(dtype=y_dtype)
-
-    dims = tuple(range(1, y.ndim)) if y.ndim > 1 else ()
-    y_mean, y_std = y_f.mean(dims, keepdim=True), y_f.std(dims, keepdim=True) + eps
-    yn_mean, yn_std = y_noised_f.mean(dims, keepdim=True), y_noised_f.std(dims, keepdim=True) + eps
-
-    y_scaled = (y_noised_f - yn_mean) / yn_std * y_std + y_mean
-    out = psi * y_scaled + (1 - psi) * y_noised_f
-    return out.to(dtype=y_dtype)
-
-
-def prompt_add_noise_sd3(
-    prompt_embeds,
-    pooled_prompt_embeds,
-    timestep,
-    n_timesteps,
-    add_noise,
-    noise_scale,
-    rescale,
-    psi,
-    t1,
-    t2
-):
+def prompt_add_noise_sd3(prompt_embeds, pooled, timestep, n_timesteps,
+                         add_noise, noise_scale, rescale, psi, t1, t2):
+    """CADS noise on SD3 prompt embeddings (conditional half only)."""
     if add_noise:
-        t = timestep / n_timesteps
-        gamma = linear_schedule(t, t1, t2)
+        gamma = linear_schedule(timestep / n_timesteps, t1, t2)
+        neg, cond = prompt_embeds.chunk(2)
+        prompt_embeds = torch.cat([neg, add_noise_to_prompt(cond, gamma, noise_scale, psi, rescale=rescale)])
+        neg_p, cond_p = pooled.chunk(2)
+        pooled = torch.cat([neg_p, add_noise_to_prompt(cond_p, gamma, noise_scale, psi, rescale=rescale)])
+    return prompt_embeds, pooled
 
-        # Split to negative and positive embeds
-        negative_prompt_embeds, cond_prompt_embeds = prompt_embeds.chunk(2)
-        cond_prompt_embeds = add_noise_to_prompt(cond_prompt_embeds, gamma, noise_scale, psi, rescale=rescale)
-        prompt_embeds = torch.cat([negative_prompt_embeds, cond_prompt_embeds], dim=0)
 
-        negative_pooled, pooled_cond = pooled_prompt_embeds.chunk(2)
-        pooled_cond = add_noise_to_prompt(pooled_cond, gamma, noise_scale, psi, rescale=rescale)
-        pooled_prompt_embeds = torch.cat([negative_pooled, pooled_cond], dim=0)
+def forward_pass(config, pipeline, model, images, prompts):
+    """SD3 two-pass training with flow-matching CFG++ and VJP memory split."""
+    B = images.size(0)
+    dtype = pipeline.transformer.dtype
 
-    return prompt_embeds, pooled_prompt_embeds
+    l = torch.rand(B).to(pipeline.device)
+    timestep = get_timestep(pipeline, batch_size=B)
+    noisy_latents, velocity_gt = to_noisy_latents_sd3(pipeline, images, timestep)
+
+    with torch.no_grad():
+        pe, ppe = encode_prompt_sd3(pipeline, prompts)
+    pe, ppe = prompt_add_noise_sd3(
+        pe, ppe, timestep, pipeline.scheduler.config.get('num_train_timesteps', 1000),
+        **config['training']['prompt_noise'])
+
+    # Pass 1: SD3 at z_t (frozen)
+    with torch.no_grad():
+        pred = denoise_single_step_sd3(pipeline, noisy_latents, pe, ppe, timestep)
+    vu, vt = pred.float().chunk(2)
+    del pred
+
+    w = model(timestep.float(), l, vu, vt)
+    v_guided = vu + w * (vt - vu)
+
+    # CFG++ step (flow matching)
+    n_steps = config['diffusion'].get('num_timesteps', 50)
+    st = (timestep.float() / 1000.0).to(device=noisy_latents.device)
+    st1 = (st - 1.0 / n_steps).clamp(min=1e-4)
+    st_, st1_ = st.view(-1, 1, 1, 1), st1.view(-1, 1, 1, 1)
+    zf = noisy_latents.float()
+    x0 = zf - st_ * v_guided
+    eps_u = zf + (1.0 - st_) * vu
+    z_next = (1.0 - st1_) * x0 + st1_ * eps_u
+
+    # Pass 2: VJP split for delta-loss
+    t_next = (st1 * 1000.0).to(dtype=timestep.dtype, device=timestep.device)
+    del x0, eps_u, zf
+    torch.cuda.empty_cache()
+
+    zd = z_next.detach().to(dtype=dtype).requires_grad_(True)
+    pred2 = denoise_single_step_sd3(pipeline, zd, pe, ppe, t_next)
+    vu2, vt2 = pred2.chunk(2)
+    delta = vt2.float() - vu2.float()
+    dl_per = (delta ** 2).mean(dim=[1, 2, 3])
+    grad_z = torch.autograd.grad((l * dl_per).sum(), zd)[0]
+    delta_proxy = (grad_z.float() * z_next).sum() / B
+
+    eps_loss = ((1 - l) * ((v_guided - velocity_gt.float()) ** 2).mean(dim=[1, 2, 3])).mean()
+    return eps_loss + delta_proxy
+
+
+def run_auto_sample(config):
+    """Find latest checkpoint and submit sampling SLURM job."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    out_dir = config['training']['out_dir']
+    pts = sorted(glob.glob(os.path.join(out_dir, 'checkpoints_*', 'checkpoint_step_*.pt')),
+                 key=os.path.getmtime)
+    if not pts:
+        print("No checkpoints found for auto-sampling.", flush=True)
+        return
+    latest = os.path.abspath(pts[-1])
+    lr = config.get('training', {}).get('optimizer_kwargs', {}).get('lr')
+    if lr is not None:
+        ckpt_id = f"sd3_lr{lr}"
+    else:
+        ckpt_id = os.path.basename(os.path.dirname(latest))
+    script = os.path.join(repo, "submit_sd3_sample.sh")
+    os.makedirs(os.path.join(repo, "logs", "sampling"), exist_ok=True)
+    print(f"\n{'='*60}\nSUBMITTING SAMPLING JOB: {ckpt_id}\n{'='*60}\n", flush=True)
+    export_vars = f"ALL,SD3_SAMPLE_CHECKPOINT={latest},SD3_SAMPLE_CHECKPOINT_ID={ckpt_id}"
+    result = subprocess.run(
+        ["sbatch", "--export", export_vars, script],
+        cwd=repo, capture_output=True, text=True)
+    print(result.stdout.strip(), flush=True)
+    if result.returncode != 0:
+        print(f"sbatch failed: {result.stderr.strip()}", flush=True)

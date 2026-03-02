@@ -5,18 +5,18 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=40G
-#SBATCH --time=01:00:00
-#SBATCH --output=logs/slurm_sd3_%j.log
-#SBATCH --error=logs/slurm_sd3_%j.log
+#SBATCH --time=06:00:00
+#SBATCH --output=logs/sampling/slurm_sd3_%j.log
+#SBATCH --error=logs/sampling/slurm_sd3_%j.log
 #SBATCH --partition=killable
-#SBATCH --nodelist=n-301,n-302,n-303,n-304,n-305,n-306,n-307,n-350
+#SBATCH --nodelist=n-801,n-802,n-803,n-804
 
 set -euo pipefail
 
 PROJECT_DIR="/home/ML_courses/03683533_2025/or_tal_almog/almog/revised-annealing-guidance"
 cd "$PROJECT_DIR"
 
-mkdir -p logs
+mkdir -p logs/sampling
 
 # Keep ALL caches/tmp inside this repo
 TMP_ROOT="$PROJECT_DIR/tmp"
@@ -139,4 +139,15 @@ print('torch =', torch.__version__)
 print('cuda available =', torch.cuda.is_available())
 PY
 
-"$PY" -u scripts/sample_sd3.py
+CKPT="${SD3_SAMPLE_CHECKPOINT:-}"
+CKPT_ID="${SD3_SAMPLE_CHECKPOINT_ID:-}"
+OUTPUT_ROOT="${SD3_SAMPLE_OUTPUT_ROOT:-results/images}/$SLURM_JOB_ID"
+
+if [[ -n "$CKPT" && -n "$CKPT_ID" ]]; then
+    "$PY" -u scripts/batch_sample_sd3.py \
+        --checkpoint "$CKPT" --checkpoint_id "$CKPT_ID" \
+        --output_root "$OUTPUT_ROOT" \
+        --cfg_baseline --force
+else
+    "$PY" -u scripts/sample_sd3.py
+fi

@@ -13,34 +13,50 @@ if _REPO_ROOT not in sys.path:
 
 import src.utils.model_utils as model_utils
 import src.utils.train_utils as train_utils
+import src.utils.train_utils_sd3 as train_utils_sd3
+import src.utils.wandb_utils as wb
 
 
-def train(config, pipeline, model, optimizer, dataloader):
+def train(config, pipeline, model, optimizer, dataloader, forward_fn=None):
+    if forward_fn is None:
+        forward_fn = forward_pass
     train_config = config['training']
     max_steps = train_config['max_steps']
     max_epochs = math.ceil(max_steps / len(dataloader))
     accumulation_steps = max(train_config.get('accumulation_steps', 1), 1)
-    
+    grad_clip = train_config.get('grad_clip', 1.0)
+
     train_end = False
     global_step = 0
-    
+    nan_count = 0
+
     datetime_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     for epoch in range(max_epochs):
         epoch_start = time.time()
-        for batch in tqdm.tqdm(dataloader):
+        for batch in tqdm.tqdm(dataloader, miniters=100, mininterval=60):
             model.train()
             prompts, images = batch
 
             images = images.to(pipeline.device)
-            
-            loss = forward_pass(config, pipeline, model, images, prompts)
 
+            loss = forward_fn(config, pipeline, model, images, prompts)
+
+            # Skip NaN losses to prevent weight corruption
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_count += 1
+                if nan_count % 10 == 1:
+                    print(f"WARNING: NaN/Inf loss at step {global_step} (total skipped: {nan_count})", flush=True)
+                optimizer.zero_grad()
+                global_step += 1
+                continue
 
             loss = loss / accumulation_steps  # Normalize loss by accumulation steps
             loss.backward()
+            wb.log_train(global_step, loss.item() * accumulation_steps, model)
 
             if (global_step + 1) % accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -183,11 +199,13 @@ if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
     print(f"GPU total VRAM (GiB): {props.total_memory / (1024**3):.2f}", flush=True)
 
-config_path = 'scripts/config.yaml'
-config, pipeline, guidance_scale_network = model_utils.load_models(
-    config_path=config_path,
-    device=device,
-)
+config_path = os.environ.get('ANNEALING_GUIDANCE_CONFIG', 'scripts/config.yaml')
+_, config = model_utils.load_config(config_path=config_path)
+is_sd3 = 'stable-diffusion-3' in config['diffusion']['model_id']
+if is_sd3:
+    pipeline, guidance_scale_network = train_utils_sd3.load_models(config, device)
+else:
+    _, pipeline, guidance_scale_network = model_utils.load_models(config_path=config_path, device=device)
 
 # Optional overrides (useful for SLURM sanity-check runs)
 _env_max_steps = os.environ.get("ANNEALING_GUIDANCE_MAX_STEPS")
@@ -207,5 +225,9 @@ dataloader = train_utils.get_data_loader(config)
 
 print(f"Dataloader ready: {len(dataloader)} batches/epoch", flush=True)
 
-
-train(config, pipeline, guidance_scale_network, optimizer, dataloader)
+forward_fn = train_utils_sd3.forward_pass if is_sd3 else forward_pass
+wb.init_training(config, guidance_scale_network)
+train(config, pipeline, guidance_scale_network, optimizer, dataloader, forward_fn=forward_fn)
+wb.finish()
+if is_sd3:
+    train_utils_sd3.run_auto_sample(config)

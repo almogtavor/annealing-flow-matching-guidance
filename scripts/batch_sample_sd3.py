@@ -164,9 +164,14 @@ def create_figure_summary(fig_dir, fig_name, prompts, lambda_values, save_path):
     # Draw column headers (lambda values)
     for j, lam in enumerate(lambda_values):
         x = row_label_w + j * (thumb_size + padding) + padding
-        label = f"λ={lam:.1f}" if lam == 0.0 or lam == 1.0 else f"λ={lam:.2f}"
-        if lam == 0.0:
+        if lam == "cfg":
+            label = "CFG"
+        elif lam == 0.0:
             label = "λ=0 (vanilla)"
+        elif lam == 0.0 or lam == 1.0:
+            label = f"λ={lam:.1f}"
+        else:
+            label = f"λ={lam:.2f}"
         draw.text((x + 10, 10), label, fill='black', font=font)
 
     # Draw each row
@@ -183,7 +188,10 @@ def create_figure_summary(fig_dir, fig_name, prompts, lambda_values, save_path):
 
         for j, lam in enumerate(lambda_values):
             x = row_label_w + j * (thumb_size + padding) + padding
-            img_path = os.path.join(prompt_dir, f"lambda_{lam:.2f}", f"seed_{SEED}.png")
+            if lam == "cfg":
+                img_path = os.path.join(prompt_dir, "cfg_baseline", f"seed_{SEED}.png")
+            else:
+                img_path = os.path.join(prompt_dir, f"lambda_{lam:.2f}", f"seed_{SEED}.png")
 
             if os.path.exists(img_path):
                 img = Image.open(img_path)
@@ -245,6 +253,14 @@ def load_pipeline_and_model(checkpoint_path, device, dtype):
     guidance_scale_model.load_state_dict(state_dict, strict=True)
     guidance_scale_model.eval()
 
+    # Verify the checkpoint is not corrupted (training may have diverged)
+    for name, param in guidance_scale_model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            raise ValueError(
+                f"Guidance model has NaN/Inf weights in '{name}'. "
+                f"Training likely diverged. Use an earlier checkpoint."
+            )
+
     return pipeline, guidance_scale_model
 
 
@@ -260,6 +276,21 @@ def generate_image(pipeline, guidance_scale_model, prompt, lambda_val, seed, dev
         use_annealing_guidance=True,
         guidance_scale_model=guidance_scale_model,
         guidance_lambda=lambda_val,
+    ).images[0]
+
+    return image
+
+
+def generate_cfg_baseline(pipeline, prompt, seed, device):
+    """Generate a single image using standard CFG (no annealing guidance)."""
+    generator = torch.Generator(device=device).manual_seed(seed)
+
+    image = pipeline(
+        prompt=prompt,
+        guidance_scale=GUIDANCE_SCALE,
+        num_inference_steps=NUM_INFERENCE_STEPS,
+        generator=generator,
+        use_annealing_guidance=False,
     ).images[0]
 
     return image
@@ -282,6 +313,8 @@ def main():
                         help='Specific lambda values. Default: 0.0 0.2 0.4 0.5 0.6 0.8 1.0')
     parser.add_argument('--force', action='store_true',
                         help='Overwrite existing images instead of skipping')
+    parser.add_argument('--cfg_baseline', action='store_true',
+                        help='Also generate standard CFG baseline images (no annealing guidance)')
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -311,7 +344,9 @@ def main():
     figures_to_process = args.figures if args.figures else list(PROMPTS_BY_FIGURE.keys())
     lambda_values = args.lambdas if args.lambdas else LAMBDA_VALUES
     prompt_filter = set(args.prompts) if args.prompts else None
-    total_expected = sum(len(lambda_values) for fn in figures_to_process if fn in PROMPTS_BY_FIGURE for pid, _ in PROMPTS_BY_FIGURE[fn] if prompt_filter is None or pid in prompt_filter)
+    n_prompts = sum(1 for fn in figures_to_process if fn in PROMPTS_BY_FIGURE for pid, _ in PROMPTS_BY_FIGURE[fn] if prompt_filter is None or pid in prompt_filter)
+    cfg_extra = n_prompts if args.cfg_baseline else 0
+    total_expected = sum(len(lambda_values) for fn in figures_to_process if fn in PROMPTS_BY_FIGURE for pid, _ in PROMPTS_BY_FIGURE[fn] if prompt_filter is None or pid in prompt_filter) + cfg_extra
     image_counter = 0
 
     # Track all generated images for summary
@@ -400,6 +435,48 @@ def main():
                     print(f"ERROR: {e}")
                     continue
 
+            # Generate CFG baseline (standard CFG without annealing guidance)
+            if args.cfg_baseline:
+                cfg_dir = os.path.join(prompt_dir, "cfg_baseline")
+                os.makedirs(cfg_dir, exist_ok=True)
+                cfg_image_path = os.path.join(cfg_dir, f"seed_{SEED}.png")
+                cfg_meta_path = os.path.join(cfg_dir, "meta.json")
+
+                if os.path.exists(cfg_image_path) and not args.force:
+                    print(f"    CFG baseline - exists, skipping")
+                    cfg_img = Image.open(cfg_image_path)
+                    images_for_grid.append(cfg_img)
+                    labels_for_grid.append("CFG")
+                else:
+                    cfg_t0 = datetime.datetime.now()
+                    try:
+                        cfg_img = generate_cfg_baseline(
+                            pipeline, prompt_text, SEED, device
+                        )
+                        cfg_img.save(cfg_image_path)
+
+                        cfg_meta = {
+                            "prompt_id": prompt_id,
+                            "prompt": prompt_text,
+                            "type": "cfg_baseline",
+                            "seed": SEED,
+                            "guidance_scale": GUIDANCE_SCALE,
+                            "num_inference_steps": NUM_INFERENCE_STEPS,
+                            "timestamp": datetime.datetime.now().isoformat(),
+                        }
+                        with open(cfg_meta_path, 'w') as f:
+                            json.dump(cfg_meta, f, indent=2)
+
+                        images_for_grid.append(cfg_img)
+                        labels_for_grid.append("CFG")
+                        total_images += 1
+                        image_counter += 1
+                        cfg_sec = (datetime.datetime.now() - cfg_t0).total_seconds()
+                        print(f"    CFG baseline | {NUM_INFERENCE_STEPS} steps in {cfg_sec:.1f}s | image {image_counter}/{total_expected}", flush=True)
+
+                    except Exception as e:
+                        print(f"ERROR generating CFG baseline: {e}")
+
             # Create grid for this prompt
             if images_for_grid:
                 grid_path = os.path.join(prompt_dir, "grid.png")
@@ -417,8 +494,9 @@ def main():
         fig_prompts = [(pid, pt) for pid, pt in prompts
                        if prompt_filter is None or pid in prompt_filter]
         if fig_prompts:
+            summary_lambdas = list(lambda_values) + (["cfg"] if args.cfg_baseline else [])
             summary_path = os.path.join(fig_dir, f"{fig_name}_summary.png")
-            create_figure_summary(fig_dir, fig_name, fig_prompts, lambda_values, summary_path)
+            create_figure_summary(fig_dir, fig_name, fig_prompts, summary_lambdas, summary_path)
 
     # Create summary directory
     summary_dir = os.path.join(output_root, "summary")
