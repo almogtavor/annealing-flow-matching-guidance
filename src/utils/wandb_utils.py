@@ -48,7 +48,7 @@ def login():
 # Init
 # ---------------------------------------------------------------------------
 
-def init_training(config, guidance_model=None):
+def init_training(config, guidance_model=None, n_samples=None):
     """Start a W&B *training* run and register a forward hook on the guidance model."""
     global _run, _mode, _guidance_model_ref, _train_start_time, _max_steps
     global _last_step_time, _loss_ema, _step_times, _train_guidance_data
@@ -65,13 +65,28 @@ def init_training(config, guidance_model=None):
     login()
 
     gpu_total_gb = None
+    gpu_name = None
     if torch.cuda.is_available():
         gpu_total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        gpu_name = torch.cuda.get_device_name(0).replace("NVIDIA ", "").replace(" ", "")
+
+    # Build descriptive run name: train_<jobid>_<gpu>_<samples>
+    slurm_job = os.getenv("SLURM_JOB_ID", "local")
+    if n_samples is None:
+        n_samples = "?"
+    model_short = config["diffusion"]["model_id"].split("/")[-1]
+    parts = ["train", slurm_job]
+    if gpu_name:
+        parts.append(gpu_name)
+    parts.append(f"{n_samples}samples")
+    parts.append(model_short)
+    run_name = "_".join(parts)
 
     _run = wandb.init(
         entity="annealing-guidance",
         project="annealing-guidance",
         job_type="train",
+        name=run_name,
         config={
             "model_id": config["diffusion"]["model_id"],
             "max_steps": config["training"]["max_steps"],
@@ -183,7 +198,7 @@ def _register_sample_hook(model):
 # Per-step training logger
 # ---------------------------------------------------------------------------
 
-def log_train(step, loss, model):
+def log_train(step, loss, model, extra_metrics=None):
     """Log loss, guidance-scale stats, time metrics, GPU utilization, and progress."""
     global _last_step_time, _loss_ema
     if _run is None:
@@ -240,6 +255,9 @@ def log_train(step, loss, model):
     # --- Progress ---
     if _max_steps:
         data["train/progress_pct"] = round(step / _max_steps * 100, 2)
+
+    if extra_metrics:
+        data.update(extra_metrics)
 
     _last_step_time = now
     _run.log(data, step=step)

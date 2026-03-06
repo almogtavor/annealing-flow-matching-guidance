@@ -1,11 +1,9 @@
-"""SD3-specific training utilities for annealing guidance.
+"""SD3-specific utilities for annealing guidance.
 
-Only contains functions that differ from the SDXL path.
-Shared functions (get_data_loader, save_model, get_timestep, linear_schedule,
-add_noise_to_prompt) are imported from train_utils.
+Contains only model-specific helpers (load, encode, denoise, noisy latents, CADS).
+Forward pass lives in scripts/train.py; shared functions in train_utils.py.
 """
 import os
-import sys
 import glob
 import subprocess
 import torch
@@ -18,7 +16,7 @@ def load_models(config, device):
     from src.model.guidance_scale_model import ScalarMLP
 
     hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
-    dtype = torch.float16 if config.get('low_memory', True) else torch.float32
+    dtype = torch.float32
 
     pipeline = MyStableDiffusion3Pipeline.from_pretrained(
         config['diffusion']['model_id'], torch_dtype=dtype, token=hf_token)
@@ -86,56 +84,6 @@ def prompt_add_noise_sd3(prompt_embeds, pooled, timestep, n_timesteps,
         pooled = torch.cat([neg_p, add_noise_to_prompt(cond_p, gamma, noise_scale, psi, rescale=rescale)])
     return prompt_embeds, pooled
 
-
-def forward_pass(config, pipeline, model, images, prompts):
-    """SD3 two-pass training with flow-matching CFG++ and VJP memory split."""
-    B = images.size(0)
-    dtype = pipeline.transformer.dtype
-
-    l = torch.rand(B).to(pipeline.device)
-    timestep = get_timestep(pipeline, batch_size=B)
-    noisy_latents, velocity_gt = to_noisy_latents_sd3(pipeline, images, timestep)
-
-    with torch.no_grad():
-        pe, ppe = encode_prompt_sd3(pipeline, prompts)
-    pe, ppe = prompt_add_noise_sd3(
-        pe, ppe, timestep, pipeline.scheduler.config.get('num_train_timesteps', 1000),
-        **config['training']['prompt_noise'])
-
-    # Pass 1: SD3 at z_t (frozen)
-    with torch.no_grad():
-        pred = denoise_single_step_sd3(pipeline, noisy_latents, pe, ppe, timestep)
-    vu, vt = pred.float().chunk(2)
-    del pred
-
-    w = model(timestep.float(), l, vu, vt)
-    v_guided = vu + w * (vt - vu)
-
-    # CFG++ step (flow matching)
-    n_steps = config['diffusion'].get('num_timesteps', 50)
-    st = (timestep.float() / 1000.0).to(device=noisy_latents.device)
-    st1 = (st - 1.0 / n_steps).clamp(min=1e-4)
-    st_, st1_ = st.view(-1, 1, 1, 1), st1.view(-1, 1, 1, 1)
-    zf = noisy_latents.float()
-    x0 = zf - st_ * v_guided
-    eps_u = zf + (1.0 - st_) * vu
-    z_next = (1.0 - st1_) * x0 + st1_ * eps_u
-
-    # Pass 2: VJP split for delta-loss
-    t_next = (st1 * 1000.0).to(dtype=timestep.dtype, device=timestep.device)
-    del x0, eps_u, zf
-    torch.cuda.empty_cache()
-
-    zd = z_next.detach().to(dtype=dtype).requires_grad_(True)
-    pred2 = denoise_single_step_sd3(pipeline, zd, pe, ppe, t_next)
-    vu2, vt2 = pred2.chunk(2)
-    delta = vt2.float() - vu2.float()
-    dl_per = (delta ** 2).mean(dim=[1, 2, 3])
-    grad_z = torch.autograd.grad((l * dl_per).sum(), zd)[0]
-    delta_proxy = (grad_z.float() * z_next).sum() / B
-
-    eps_loss = ((1 - l) * ((v_guided - velocity_gt.float()) ** 2).mean(dim=[1, 2, 3])).mean()
-    return eps_loss + delta_proxy
 
 
 def run_auto_sample(config):

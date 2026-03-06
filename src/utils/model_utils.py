@@ -1,4 +1,3 @@
-import os
 import torch
 
 from src.schedulers.my_scheduling_ddim import MyDDIMScheduler
@@ -32,8 +31,6 @@ def load_models(checkpoint_path=None, config_path=None, device=None):
     return config, pipeline, guidance_scale_network
 
 def get_dtype(config):
-    if os.environ.get("ANNEALING_GUIDANCE_FORCE_FP16", "0") == "1":
-        return torch.float16
     dtype = torch.float16 if config.get('low_memory', True) else torch.float32
     return dtype
 
