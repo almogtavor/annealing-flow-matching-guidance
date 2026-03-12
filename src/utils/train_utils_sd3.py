@@ -111,3 +111,15 @@ def run_auto_sample(config):
     print(result.stdout.strip(), flush=True)
     if result.returncode != 0:
         print(f"sbatch failed: {result.stderr.strip()}", flush=True)
+
+    # Also submit fig2 comparison job
+    fig2_script = os.path.join(repo, "submit_sampling_woman_black_dress.sh")
+    if os.path.exists(fig2_script):
+        print(f"\n{'='*60}\nSUBMITTING FIG2 COMPARISON JOB\n{'='*60}\n", flush=True)
+        fig2_vars = f"ALL,FIG2_CHECKPOINT={latest}"
+        result2 = subprocess.run(
+            ["sbatch", "--export", fig2_vars, fig2_script],
+            cwd=repo, capture_output=True, text=True)
+        print(result2.stdout.strip(), flush=True)
+        if result2.returncode != 0:
+            print(f"fig2 sbatch failed: {result2.stderr.strip()}", flush=True)

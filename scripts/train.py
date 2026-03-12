@@ -15,9 +15,11 @@ import src.utils.model_utils as model_utils
 import src.utils.train_utils as train_utils
 import src.utils.train_utils_sd3 as train_utils_sd3
 import src.utils.wandb_utils as wb
+import src.utils.resume_utils as resume_utils
+import src.utils.ddp_utils as ddp_utils; ddp_utils.setup()
 
 
-def train(config, pipeline, model, optimizer, dataloader, forward_fn=None):
+def train(config, pipeline, model, optimizer, dataloader, forward_fn=None, resume_step=0):
     if forward_fn is None:
         forward_fn = forward_pass
     train_config = config['training']
@@ -40,7 +42,17 @@ def train(config, pipeline, model, optimizer, dataloader, forward_fn=None):
 
             images = images.to(pipeline.device)
 
-            loss = forward_fn(config, pipeline, model, images, prompts)
+            if global_step < resume_step:
+                global_step += 1
+                continue
+
+            result = forward_fn(config, pipeline, model, images, prompts)
+            if isinstance(result, dict):
+                loss = result['loss']
+                extra_metrics = {k: v for k, v in result.items() if k != 'loss'}
+            else:
+                loss = result
+                extra_metrics = None
 
             # Skip NaN losses to prevent weight corruption
             if torch.isnan(loss) or torch.isinf(loss):
@@ -53,7 +65,7 @@ def train(config, pipeline, model, optimizer, dataloader, forward_fn=None):
 
             loss = loss / accumulation_steps  # Normalize loss by accumulation steps
             loss.backward()
-            wb.log_train(global_step, loss.item() * accumulation_steps, model)
+            wb.log_train(global_step, loss.item() * accumulation_steps, model, extra_metrics=extra_metrics)
 
             if (global_step + 1) % accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -62,7 +74,7 @@ def train(config, pipeline, model, optimizer, dataloader, forward_fn=None):
 
             if global_step > 0 and global_step % config['training']['save_interval'] == 0:
                 print(f"Saving model at step {global_step}...")
-                train_utils.save_model(config, model, global_step, datetime_timestamp)
+                resume_utils.save_checkpoint(config, model, optimizer, global_step, datetime_timestamp)
 
 
             global_step += 1
@@ -144,53 +156,100 @@ def forward_pass(
     # Find indices in the reversed array
     timestep_indices = torch.searchsorted(scheduler_timesteps_reversed, timestep, right=True) - 1
     valid_indices = (timestep_indices - 1) >= 0
-    delta_t_minus_one = torch.zeros_like(noisy_latents)
     if valid_indices.any():
         timestep_indices = timestep_indices[valid_indices]
         timestep_prev = scheduler_timesteps_reversed[timestep_indices - 1]
         pred_latents_prev = pred_latents_prev[valid_indices]
         prompt = [p for p, valid in zip(prompts, valid_indices.cpu().numpy()) if valid]
-        # Filter other necessary tensors like prompt_embeds or added_cond_kwargs if they have a batch dimension
 
         with torch.no_grad():
             prompt_embeds, added_cond_kwargs = train_utils.encode_prompt(pipeline, prompt)
-            
-        # IMPORTANT: By default we do NOT backprop through this second UNet call.
-        # Backprop here creates a very large autograd graph and commonly OOMs on <=16GB GPUs.
-        backprop_through_prev = os.environ.get("ANNEALING_GUIDANCE_BACKPROP_THROUGH_PREV", "0") == "1"
-        if not backprop_through_prev:
-            pred_latents_prev = pred_latents_prev.detach()
 
-        _kwargs = {
-            k: v[valid_indices] if isinstance(v, torch.Tensor) and v.shape[0] == valid_indices.shape[0] else v
-            for k, v in added_cond_kwargs.items()
-        }
-
-        if backprop_through_prev:
-            noise_pred_prev = train_utils.denoise_single_step(
-                pipeline,
-                pred_latents_prev,
-                prompt_embeds,
-                timestep_prev,
-                _kwargs,
-            )[0]
-        else:
-            with torch.no_grad():
-                noise_pred_prev = train_utils.denoise_single_step(
-                    pipeline,
-                    pred_latents_prev,
-                    prompt_embeds,
-                    timestep_prev,
-                    _kwargs,
-                )[0]
+        noise_pred_prev = train_utils.denoise_single_step(
+            pipeline,
+            pred_latents_prev,
+            prompt_embeds,
+            timestep_prev,
+            {k: v[valid_indices] if isinstance(v, torch.Tensor) and v.shape[0] == valid_indices.shape[0] else v
+            for k, v in added_cond_kwargs.items()},
+        )[0]
 
         noise_pred_uncond_prev, noise_pred_text_prev = noise_pred_prev.chunk(2, dim=0)
         delta_t_minus_one = noise_pred_uncond_prev - noise_pred_text_prev
-        
+
     # calc loss
     loss = train_utils.calc_loss(noise_pred, noise_gt, delta_t_minus_one, l)
 
     return loss
+
+
+def forward_pass_sd3(
+    config,
+    pipeline,
+    model,
+    images,
+    prompts,
+):
+    """SD3 forward pass: flow-matching adaptation of Algorithm 1."""
+    B = images.size(0)
+    dtype = pipeline.transformer.dtype
+
+    l = torch.rand(B).to(pipeline.device)
+    timestep = train_utils.get_timestep(pipeline, batch_size=B)
+    noisy_latents, velocity_gt = train_utils_sd3.to_noisy_latents_sd3(pipeline, images, timestep)
+
+    with torch.no_grad():
+        pe, ppe = train_utils_sd3.encode_prompt_sd3(pipeline, prompts)
+    pe, ppe = train_utils_sd3.prompt_add_noise_sd3(
+        pe, ppe, timestep, pipeline.scheduler.config.get('num_train_timesteps', 1000),
+        **config['training']['prompt_noise'])
+
+    # Pass 1: SD3 at z_t (frozen)
+    with torch.no_grad():
+        pred = train_utils_sd3.denoise_single_step_sd3(pipeline, noisy_latents, pe, ppe, timestep)
+    vu, vt = pred.float().chunk(2)
+    del pred
+
+    w = model(timestep.float(), l, vu, vt)
+    v_guided = vu + w * (vt - vu)
+
+    # CFG++ step (flow matching)
+    n_steps = config['diffusion'].get('num_timesteps', 50)
+    st = (timestep.float() / 1000.0).to(device=noisy_latents.device)
+    st1 = (st - 1.0 / n_steps).clamp(min=1e-4)
+    st_, st1_ = st.view(-1, 1, 1, 1), st1.view(-1, 1, 1, 1)
+    zf = noisy_latents.float()
+    x0 = zf - st_ * v_guided
+    eps_u = zf + (1.0 - st_) * vu
+    z_next = (1.0 - st1_) * x0 + st1_ * eps_u
+
+    # Pass 2: direct delta loss (full backprop through frozen transformer)
+    t_next = (st1 * 1000.0).to(dtype=timestep.dtype, device=timestep.device)
+    del x0, eps_u, zf
+    torch.cuda.empty_cache()
+
+    pred2 = train_utils_sd3.denoise_single_step_sd3(pipeline, z_next.to(dtype=dtype), pe, ppe, t_next)
+    vu2, vt2 = pred2.float().chunk(2)
+    delta = vt2 - vu2
+
+    # Same loss structure as SDXL but with velocity instead of noise
+    loss = train_utils.calc_loss(v_guided, velocity_gt.float(), delta, l)
+
+    eps_val = ((1 - l) * ((v_guided - velocity_gt.float()) ** 2).mean(dim=[1, 2, 3])).mean()
+    diff_val = (l * (delta ** 2).mean(dim=[1, 2, 3])).mean()
+
+    # Delta/velocity diagnostics
+    delta_t = (vt - vu)  # delta at current timestep
+    delta_norm = delta_t.view(B, -1).norm(dim=1).mean().item()
+    delta_next_norm = delta.view(B, -1).norm(dim=1).mean().item()
+    return {
+        'loss': loss,
+        'train/eps_loss': eps_val.item(),
+        'train/diff_loss': diff_val.item(),
+        'train/delta_norm': delta_norm,
+        'train/delta_next_norm': delta_next_norm,
+    }
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -206,6 +265,7 @@ if is_sd3:
     pipeline, guidance_scale_network = train_utils_sd3.load_models(config, device)
 else:
     _, pipeline, guidance_scale_network = model_utils.load_models(config_path=config_path, device=device)
+guidance_scale_network = ddp_utils.wrap(guidance_scale_network)
 
 # Optional overrides (useful for SLURM sanity-check runs)
 _env_max_steps = os.environ.get("ANNEALING_GUIDANCE_MAX_STEPS")
@@ -225,9 +285,11 @@ dataloader = train_utils.get_data_loader(config)
 
 print(f"Dataloader ready: {len(dataloader)} batches/epoch", flush=True)
 
-forward_fn = train_utils_sd3.forward_pass if is_sd3 else forward_pass
-wb.init_training(config, guidance_scale_network)
-train(config, pipeline, guidance_scale_network, optimizer, dataloader, forward_fn=forward_fn)
+resume_step = resume_utils.maybe_resume(config, guidance_scale_network, optimizer)
+
+forward_fn = forward_pass_sd3 if is_sd3 else forward_pass
+wb.init_training(config, guidance_scale_network, n_samples=len(dataloader))
+train(config, pipeline, guidance_scale_network, optimizer, dataloader, forward_fn=forward_fn, resume_step=resume_step)
 wb.finish()
 if is_sd3:
     train_utils_sd3.run_auto_sample(config)

@@ -77,6 +77,7 @@ class MyStableDiffusion3Pipeline(StableDiffusion3Pipeline):
         use_annealing_guidance: bool = False,
         guidance_scale_model: Optional[ScalarMLP] = None,
         guidance_lambda: Optional[float] = None,
+        use_cfgpp: bool = False,
     ):
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
@@ -103,6 +104,10 @@ class MyStableDiffusion3Pipeline(StableDiffusion3Pipeline):
         )
 
         self._guidance_scale = guidance_scale
+        self._cfgpp_w = guidance_scale if use_cfgpp else None
+        # CFG++ with w<1 still needs both cond/uncond predictions
+        if use_cfgpp and guidance_scale <= 1.0:
+            self._guidance_scale = 1.1  # force do_classifier_free_guidance=True
         self._skip_layer_guidance_scale = skip_layer_guidance_scale
         self._clip_skip = clip_skip
         self._joint_attention_kwargs = joint_attention_kwargs
@@ -228,18 +233,29 @@ class MyStableDiffusion3Pipeline(StableDiffusion3Pipeline):
                 )[0]
 
                 # perform guidance
+                _use_cfgpp_step = False
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
 
-                    # --- BEGIN MODIFIED: Annealing guidance with CFG++ ---
+                    # --- BEGIN MODIFIED: Annealing guidance / CFG++ / CFG ---
                     if use_annealing_guidance and guidance_scale_model is not None:
+                        # Learned annealing guidance (CFG++ sampling)
                         orig_dtype = noise_pred_uncond.dtype
                         guidance_scale_pred = guidance_scale_model(
                             t, guidance_lambda,
                             noise_pred_uncond.float(), noise_pred_text.float()
                         )
                         v_guided = noise_pred_uncond.float() + guidance_scale_pred * (noise_pred_text.float() - noise_pred_uncond.float())
+                        _use_cfgpp_step = True
+                    elif use_cfgpp:
+                        # Fixed-w CFG++ sampling
+                        orig_dtype = noise_pred_uncond.dtype
+                        v_guided = noise_pred_uncond.float() + self._cfgpp_w * (noise_pred_text.float() - noise_pred_uncond.float())
+                        _use_cfgpp_step = True
+                    else:
+                        noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
+                    if _use_cfgpp_step:
                         # CFG++ denoising step (flow-matching equivalent):
                         #   x0_pred  = z_t - sigma_t * v_guided       (guided signal estimate)
                         #   eps_uncond = z_t + (1-sigma_t) * v_uncond  (unconditional noise)
@@ -256,8 +272,6 @@ class MyStableDiffusion3Pipeline(StableDiffusion3Pipeline):
                         if self.scheduler.step_index is None:
                             self.scheduler._init_step_index(t)
                         self.scheduler._step_index += 1
-                    else:
-                        noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
                     # --- END MODIFIED ---
 
                     should_skip_layers = (
@@ -283,7 +297,7 @@ class MyStableDiffusion3Pipeline(StableDiffusion3Pipeline):
                         )
 
                 # compute the previous noisy sample x_t -> x_t-1
-                if not (use_annealing_guidance and guidance_scale_model is not None):
+                if not _use_cfgpp_step:
                     latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
                 latents_dtype = latents.dtype
 
