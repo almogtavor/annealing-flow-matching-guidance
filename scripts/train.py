@@ -251,12 +251,14 @@ def forward_pass_sd3(
     }
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if not torch.cuda.is_available():
+    print("FATAL: CUDA not available. Refusing to run on CPU.")
+    sys.exit(1)
+device = torch.device("cuda")
 
-if torch.cuda.is_available():
-    props = torch.cuda.get_device_properties(0)
-    print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
-    print(f"GPU total VRAM (GiB): {props.total_memory / (1024**3):.2f}", flush=True)
+props = torch.cuda.get_device_properties(0)
+print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+print(f"GPU total VRAM (GiB): {props.total_memory / (1024**3):.2f}", flush=True)
 
 config_path = os.environ.get('ANNEALING_GUIDANCE_CONFIG', 'scripts/config.yaml')
 _, config = model_utils.load_config(config_path=config_path)

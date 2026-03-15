@@ -9,6 +9,7 @@
 #SBATCH --output=logs/slurm_%j.log
 #SBATCH --error=logs/slurm_%j.log
 #SBATCH --partition=killable
+#SBATCH --nodelist=n-801,n-802,n-803,n-804
 
 set -euo pipefail
 
@@ -147,57 +148,21 @@ if ! (ensure_torch && ensure_requirements); then
 fi
 
 "$PY" - <<'PY'
-import torch
+import torch, sys
 print('torch =', torch.__version__)
 print('cuda available =', torch.cuda.is_available())
+if not torch.cuda.is_available():
+    print("FATAL: CUDA not available. Exiting to avoid hanging on CPU.", file=sys.stderr)
+    sys.exit(1)
+print('gpu =', torch.cuda.get_device_name(0))
 PY
 
-# If the dataset isn't present in the repo, create a tiny dummy dataset inside ./tmp
-# so the job can run end-to-end without writing outside this directory.
+# Verify real dataset exists — do NOT fall back to dummy data
 DEFAULT_IMAGE_ROOT="$PROJECT_DIR/src/data/laion/laion_top20k_images"
 if [[ ! -d "$DEFAULT_IMAGE_ROOT" ]]; then
-	echo "Dataset not found at $DEFAULT_IMAGE_ROOT; creating a tiny dummy dataset under $TMP_ROOT/dummy_laion"
-	DUMMY_ROOT="$TMP_ROOT/dummy_laion"
-	SHARD_DIR="$DUMMY_ROOT/00000"
-	mkdir -p "$SHARD_DIR"
-
-	PROJECT_DIR="$PROJECT_DIR" DUMMY_ROOT="$DUMMY_ROOT" SHARD_DIR="$SHARD_DIR" "$PY" - <<'PY'
-import os
-import numpy as np
-
-try:
-	from PIL import Image
-except Exception as e:
-	raise SystemExit(f"PIL/Pillow is required to generate dummy images: {e}")
-
-dummy_root = os.environ["DUMMY_ROOT"]
-shard_dir = os.environ["SHARD_DIR"]
-
-os.makedirs(shard_dir, exist_ok=True)
-
-captions = [
-	"a photo of a cat",
-	"a photo of a dog",
-	"a scenic landscape",
-	"a portrait photo",
-]
-
-for i, caption in enumerate(captions):
-	# Smaller source images are fine; the dataset transform resizes/crops to 1024.
-	arr = (np.random.rand(512, 512, 3) * 255).astype("uint8")
-	img = Image.fromarray(arr, mode="RGB")
-	base = os.path.join(shard_dir, f"{i:06d}")
-	img.save(base + ".jpg", quality=90)
-	with open(base + ".txt", "w", encoding="utf-8") as f:
-		f.write(caption + "\n")
-
-print(f"Dummy dataset ready at: {dummy_root}")
-PY
-
-	export ANNEALING_GUIDANCE_IMAGE_ROOT="$DUMMY_ROOT"
-	# Keep the sanity check short unless user overrides.
-	export ANNEALING_GUIDANCE_MAX_STEPS="${ANNEALING_GUIDANCE_MAX_STEPS:-200}"
-	export ANNEALING_GUIDANCE_SAVE_INTERVAL="${ANNEALING_GUIDANCE_SAVE_INTERVAL:-50}"
+	echo "ERROR: Dataset not found at $DEFAULT_IMAGE_ROOT"
+	echo "Run: sbatch submit_download_laion.sh"
+	exit 1
 fi
 
 PROJECT_DIR="$PROJECT_DIR" DUMMY_ROOT="${DUMMY_ROOT:-}" SHARD_DIR="${SHARD_DIR:-}" "$PY" -u scripts/train.py

@@ -2,14 +2,14 @@
 #SBATCH --job-name=sd3-sample
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=40G
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=160G
 #SBATCH --time=06:00:00
 #SBATCH --output=logs/sampling/slurm_sd3_%j.log
 #SBATCH --error=logs/sampling/slurm_sd3_%j.log
 #SBATCH --partition=killable
-#SBATCH --nodelist=n-801,n-802,n-803,n-804
+#SBATCH --nodelist=n-501,n-502,n-503,n-601,n-602,n-801,n-802,n-803,n-804,n-805,n-806,rack-bgw-dgx1,rack-gww-dgx1
 
 set -euo pipefail
 
@@ -57,6 +57,14 @@ mkdir -p "$MPLCONFIGDIR"
 # pip cache (avoid ~/.cache/pip)
 export PIP_CACHE_DIR="$TMP_ROOT/pip_cache"
 mkdir -p "$PIP_CACHE_DIR"
+
+# W&B: keep data in project dir and disable service mode (its Unix-socket
+# transport uses /tmp which is unreliable on SLURM nodes).
+export WANDB_DIR="$TMP_ROOT/wandb"
+export WANDB_CACHE_DIR="$TMP_ROOT/wandb_cache"
+export WANDB_DATA_DIR="$TMP_ROOT/wandb_data"
+mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR"
+export WANDB__REQUIRE_SERVICE=false
 
 # Make sure logs are streamed to SLURM output
 export PYTHONUNBUFFERED=1
@@ -132,22 +140,53 @@ else
 	touch "$DEPS_MARKER"
 fi
 
+NGPUS="${SLURM_GPUS_ON_NODE:-4}"
+
 echo "Python: $($PY -V)"
 "$PY" - <<'PY'
-import torch
+import torch, sys
 print('torch =', torch.__version__)
 print('cuda available =', torch.cuda.is_available())
+if not torch.cuda.is_available():
+    print("FATAL: CUDA not available. Exiting to avoid hanging on CPU.", file=sys.stderr)
+    sys.exit(1)
+n = torch.cuda.device_count()
+print(f'gpus = {n}')
+for i in range(n):
+    print(f'  gpu {i}: {torch.cuda.get_device_name(i)}')
 PY
 
 CKPT="${SD3_SAMPLE_CHECKPOINT:-}"
 CKPT_ID="${SD3_SAMPLE_CHECKPOINT_ID:-}"
 OUTPUT_ROOT="${SD3_SAMPLE_OUTPUT_ROOT:-results/images}/$SLURM_JOB_ID"
 
+TORCHRUN="$ENV_DIR/bin/torchrun"
+if [[ ! -x "$TORCHRUN" ]]; then
+    TORCHRUN="$PY -m torch.distributed.run"
+fi
+
 if [[ -n "$CKPT" && -n "$CKPT_ID" ]]; then
-    "$PY" -u scripts/batch_sample_sd3.py \
+    $TORCHRUN --nproc_per_node="$NGPUS" --standalone \
+        scripts/batch_sample_sd3.py \
         --checkpoint "$CKPT" --checkpoint_id "$CKPT_ID" \
         --output_root "$OUTPUT_ROOT" \
-        --cfg_baseline --force
+        --baselines --force
+
+    # Generate analysis plots (single GPU, fast)
+    W_PLOT_DIR="$OUTPUT_ROOT/$CKPT_ID"
+
+    echo "Generating w_scale_analysis plot..."
+    "$PY" -u scripts/plot_w_scale_analysis.py \
+        --checkpoint "$CKPT" \
+        --output "$W_PLOT_DIR/w_scale_analysis.png" \
+        --lr_label "$CKPT_ID"
+
+    echo "Generating w heatmap..."
+    "$PY" -u scripts/plot_w_heatmap.py \
+        --checkpoint "$CKPT" \
+        --output "$W_PLOT_DIR/w_heatmap.png" \
+        --lr_label "$CKPT_ID" \
+        --lambdas 0.0 0.4 0.6 0.8 1.0
 else
     "$PY" -u scripts/sample_sd3.py
 fi

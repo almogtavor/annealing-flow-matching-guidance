@@ -50,7 +50,7 @@ def get_timestep(pipeline, batch_size=1):
     return timesteps
 
 
-def calc_loss(noise_pred, noise_gt, delta_t_minus_one, l):
+def calc_loss(noise_pred, noise_gt, delta_t_minus_one, l, _ema=[None, None]):
     loss = torch.tensor(0.0, device=noise_pred.device)
     diff_loss = torch.tensor(0.0, device=noise_pred.device)
     eps_loss = torch.tensor(0.0, device=noise_pred.device)
@@ -63,7 +63,10 @@ def calc_loss(noise_pred, noise_gt, delta_t_minus_one, l):
     # delta loss
     squared_errors = (delta_t_minus_one ** 2).mean(dim=[1,2,3])
     diff_loss = (l * squared_errors).mean()
-    loss += diff_loss
+    _ema[0] = eps_loss.item() if _ema[0] is None else 0.999 * _ema[0] + 0.001 * eps_loss.item()
+    _ema[1] = diff_loss.item() if _ema[1] is None else 0.999 * _ema[1] + 0.001 * diff_loss.item()
+    ratio = min(_ema[0] / max(_ema[1], 1e-8), 1e4)
+    loss += ratio * diff_loss
 
 
     return loss

@@ -1,15 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=sd3-batch
+#SBATCH --job-name=annealing-guidance-sample
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=160G
-#SBATCH --time=12:00:00
-#SBATCH --output=logs/slurm_sd3_batch_%j.log
-#SBATCH --error=logs/slurm_sd3_batch_%j.log
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=20G
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/slurm_sample_%j.log
+#SBATCH --error=logs/slurm_sample_%j.log
 #SBATCH --partition=killable
-#SBATCH --nodelist=n-301,n-302,n-303,n-304,n-305,n-306,n-307,n-350,n-801,n-802,n-803,n-804
+#SBATCH --nodelist=n-801,n-802,n-803,n-804
 
 set -euo pipefail
 
@@ -45,28 +45,32 @@ export TORCH_HOME="$TMP_ROOT/torch"
 export TORCH_EXTENSIONS_DIR="$TMP_ROOT/torch_extensions"
 mkdir -p "$TORCH_HOME" "$TORCH_EXTENSIONS_DIR"
 
-# Triton / CUDA compilation caches
+# Triton / CUDA compilation caches (if used)
 export TRITON_CACHE_DIR="$TMP_ROOT/triton"
 export CUDA_CACHE_PATH="$TMP_ROOT/nv_cache"
 mkdir -p "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH"
 
-# Matplotlib
+# W&B (if enabled)
+export WANDB_DIR="$TMP_ROOT/wandb"
+export WANDB_CACHE_DIR="$TMP_ROOT/wandb_cache"
+export WANDB_DATA_DIR="$TMP_ROOT/wandb_data"
+mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR"
+
+# Matplotlib (avoid writing to $HOME)
 export MPLCONFIGDIR="$TMP_ROOT/matplotlib"
 mkdir -p "$MPLCONFIGDIR"
 
-# pip cache
+# pip cache (avoid ~/.cache/pip)
 export PIP_CACHE_DIR="$TMP_ROOT/pip_cache"
 mkdir -p "$PIP_CACHE_DIR"
 
-# Stream output
+# Make sure logs are streamed to SLURM output
 export PYTHONUNBUFFERED=1
 
-# Load Hugging Face token from .env
-if [[ -f "$PROJECT_DIR/.env" ]]; then
-    export $(grep -v '^#' "$PROJECT_DIR/.env" | grep -E 'HUGGINGFACE_HUB_TOKEN|HF_TOKEN' | xargs)
-fi
+# Default to fp16 for SLURM runs unless user explicitly disables it.
+export ANNEALING_GUIDANCE_FORCE_FP16="${ANNEALING_GUIDANCE_FORCE_FP16:-1}"
 
-DEPS_MARKER="$TMP_ROOT/deps_batch_installed.ok"
+DEPS_MARKER="$TMP_ROOT/deps_installed.ok"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 ENV_DIR="${ENV_DIR:-$PROJECT_DIR/venv}"
@@ -81,7 +85,7 @@ PY="$ENV_DIR/bin/python"
 ensure_torch() {
 	"$PY" - <<'PY'
 try:
-    import torch
+    import torch  # noqa: F401
 except Exception:
     raise SystemExit(1)
 raise SystemExit(0)
@@ -91,13 +95,10 @@ PY
 ensure_requirements() {
 	"$PY" - <<'PY'
 try:
-    import diffusers
-    import transformers
-    import omegaconf
-    import dotenv
-    import sentencepiece
-    import google.protobuf
-    from PIL import Image, ImageDraw, ImageFont
+    import diffusers  # noqa: F401
+    import transformers  # noqa: F401
+    import omegaconf  # noqa: F401
+    import dotenv  # noqa: F401
 except Exception:
     raise SystemExit(1)
 raise SystemExit(0)
@@ -114,7 +115,7 @@ if ensure_torch && ensure_requirements; then
 else
 	"$PY" -m pip install -q --upgrade pip wheel setuptools
 	if ! ensure_torch; then
-		echo "Installing dependencies into venv..."
+		echo "Installing dependencies into venv (this may take a few minutes on first run)..."
 
 		TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
 		TORCH_VERSION="${TORCH_VERSION:-2.3.1+cu121}"
@@ -133,33 +134,4 @@ else
 	touch "$DEPS_MARKER"
 fi
 
-echo "Python: $($PY -V)"
-"$PY" - <<'PY'
-import torch, sys
-print('torch =', torch.__version__)
-print('cuda available =', torch.cuda.is_available())
-if not torch.cuda.is_available():
-    print("FATAL: CUDA not available. Exiting to avoid hanging on CPU.", file=sys.stderr)
-    sys.exit(1)
-print('gpu =', torch.cuda.get_device_name(0))
-PY
-
-echo ""
-echo "Starting batch image generation..."
-echo "============================================"
-
-NGPUS="${SLURM_GPUS_ON_NODE:-4}"
-TORCHRUN="$ENV_DIR/bin/torchrun"
-if [[ ! -x "$TORCHRUN" ]]; then
-    TORCHRUN="$PY -m torch.distributed.run"
-fi
-
-# Run batch sampling across GPUs - pass any extra arguments
-$TORCHRUN --nproc_per_node="$NGPUS" --standalone \
-    scripts/batch_sample_sd3.py \
-    --checkpoint "/home/ML_courses/03683533_2025/or_tal_almog/almog/revised-annealing-guidance/output/checkpoints_sd3_20260224_020326/checkpoint_final.pt" \
-    --checkpoint_id "sd3_cfgpp_v1" \
-    --output_root "results/images" \
-    --lambdas 0.0 0.2 0.4 0.6 0.8 1.0 \
-    --force \
-    "$@"
+"$PY" -u scripts/sample.py

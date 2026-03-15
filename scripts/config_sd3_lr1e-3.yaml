@@ -1,5 +1,4 @@
 seed: 42
-low_memory: true
 diffusion:
   model_id: stabilityai/stable-diffusion-3-medium-diffusers
   num_timesteps: 50
@@ -22,7 +21,7 @@ guidance_scale_model:
   delta_embed_dim: 4
   t_embed_dim: 4
   t_embed_normalization: 1000
-  delta_embed_normalization: 5.0
+  delta_embed_normalization: 30
   w_scale: 1
   w_bias: 1
 
@@ -31,7 +30,7 @@ training:
   max_steps: 20000
   batch_size: 1
   accumulation_steps: 16
-  out_dir: ./output/lr_1e-3
+  out_dir: ./output/lr_1e-3_dn30
   image_root: src/data/laion/laion_pop_images/
   optimizer_kwargs:
     weight_decay: 0.01

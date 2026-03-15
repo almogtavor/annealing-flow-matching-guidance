@@ -75,10 +75,13 @@ def init_training(config, guidance_model=None, n_samples=None):
     if n_samples is None:
         n_samples = "?"
     model_short = config["diffusion"]["model_id"].split("/")[-1]
+    gsm = config.get("guidance_scale_model", {})
+    delta_norm = gsm.get("delta_embed_normalization", "?")
     parts = ["train", slurm_job]
     if gpu_name:
         parts.append(gpu_name)
     parts.append(f"{n_samples}samples")
+    parts.append(f"dn{delta_norm}")
     parts.append(model_short)
     run_name = "_".join(parts)
 
@@ -87,6 +90,7 @@ def init_training(config, guidance_model=None, n_samples=None):
         project="annealing-guidance",
         job_type="train",
         name=run_name,
+        settings=wandb.Settings(start_method="thread"),
         config={
             "model_id": config["diffusion"]["model_id"],
             "max_steps": config["training"]["max_steps"],
@@ -126,11 +130,25 @@ def init_sampling(config_dict, guidance_model=None):
     _sample_last_image_time = _sample_start_time
     login()
 
+    # Build descriptive run name: sample_<jobid>_<gpu>_<ckpt_id>
+    slurm_job = os.getenv("SLURM_JOB_ID", "local")
+    ckpt_id = config_dict.get("checkpoint_id", "unknown")
+    gpu_name = None
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0).replace("NVIDIA ", "").replace(" ", "")
+    parts = ["sample", slurm_job]
+    if gpu_name:
+        parts.append(gpu_name)
+    parts.append(ckpt_id)
+    run_name = "_".join(parts)
+
     _run = wandb.init(
         entity="annealing-guidance",
         project="annealing-guidance",
         job_type="sample",
+        name=run_name,
         config=config_dict,
+        settings=wandb.Settings(start_method="thread"),
     )
 
     if guidance_model is not None:
@@ -149,11 +167,16 @@ def init_sampling(config_dict, guidance_model=None):
 # ---------------------------------------------------------------------------
 
 def _register_train_hook(model):
-    """Store the last (timestep, w, lambda) on the model after each forward."""
+    """Store the last (timestep, w, lambda, delta_norm) on the model after each forward."""
     def hook(module, input, output):
         module._wb_last_w = output.detach()
         module._wb_last_t = input[0].detach() if isinstance(input[0], torch.Tensor) else torch.tensor(input[0])
         module._wb_last_lam = input[1].detach() if isinstance(input[1], torch.Tensor) else torch.tensor(input[1])
+        # delta = uncond - text (inputs 2 and 3 to ScalarMLP)
+        if len(input) >= 4 and isinstance(input[2], torch.Tensor):
+            delta = (input[2] - input[3]).detach().float()
+            B = delta.shape[0]
+            module._wb_last_delta_norm = delta.view(B, -1).norm(dim=1)
     model.register_forward_hook(hook)
 
 
@@ -169,7 +192,15 @@ def _register_sample_hook(model):
         w_val = output.detach().float().mean().item()
         lam = input[1]
         lam_val = lam.float().mean().item() if isinstance(lam, torch.Tensor) else float(lam)
-        module._wb_sample_data.append({"timestep": t_val, "guidance_scale": w_val, "lambda": lam_val})
+        # Compute delta_norm (uncond - text velocity difference)
+        delta_norm_val = 0.0
+        if len(input) >= 4 and isinstance(input[2], torch.Tensor):
+            delta = (input[2] - input[3]).detach().float()
+            delta_norm_val = delta.view(delta.shape[0], -1).norm(dim=1).mean().item()
+        module._wb_sample_data.append({
+            "timestep": t_val, "guidance_scale": w_val, "lambda": lam_val,
+            "delta_norm": delta_norm_val,
+        })
 
         # Detect new generation start (timestep jumped back up) → log previous image timing
         if module._wb_prev_t is not None and t_val > module._wb_prev_t + 50:
@@ -228,6 +259,13 @@ def log_train(step, loss, model, extra_metrics=None):
     if hasattr(model, '_wb_last_lam'):
         data["train/lambda"] = model._wb_last_lam.float().mean().item()
 
+    if hasattr(model, '_wb_last_delta_norm'):
+        dn = model._wb_last_delta_norm.float()
+        data["train/delta_norm"] = dn.mean().item()
+        if dn.numel() > 1:
+            data["train/delta_norm_min"] = dn.min().item()
+            data["train/delta_norm_max"] = dn.max().item()
+
     # --- GPU metrics ---
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
@@ -262,14 +300,31 @@ def log_train(step, loss, model, extra_metrics=None):
     _last_step_time = now
     _run.log(data, step=step)
 
-    # Accumulate for the final scatter plots (w vs timestep, w vs lambda)
+    # Periodic stats to SLURM log (every 200 steps)
+    if step % 200 == 0:
+        parts = [f"[step {step}] loss={loss:.4f} ema={_loss_ema:.4f}"]
+        if hasattr(model, '_wb_last_w'):
+            w = model._wb_last_w.float()
+            parts.append(f"w: mean={w.mean().item():.3f} min={w.min().item():.3f} max={w.max().item():.3f}")
+        if hasattr(model, '_wb_last_delta_norm'):
+            dn = model._wb_last_delta_norm.float()
+            parts.append(f"delta: mean={dn.mean().item():.3f} min={dn.min().item():.3f} max={dn.max().item():.3f}")
+        if _max_steps and step > 0:
+            remaining = max(_max_steps - step, 0)
+            eta_h = remaining * avg_step_time / 3600
+            parts.append(f"ETA={eta_h:.1f}h")
+        print(" | ".join(parts), flush=True)
+
+    # Accumulate for the final scatter plots (w vs timestep, w vs lambda, delta_norm)
     if hasattr(model, '_wb_last_w') and hasattr(model, '_wb_last_t') and hasattr(model, '_wb_last_lam'):
-        for t_v, w_v, l_v in zip(
+        dn_vals = model._wb_last_delta_norm.float().cpu().view(-1) if hasattr(model, '_wb_last_delta_norm') else None
+        for i, (t_v, w_v, l_v) in enumerate(zip(
             model._wb_last_t.float().cpu().view(-1),
             model._wb_last_w.float().cpu().view(-1),
             model._wb_last_lam.float().cpu().view(-1),
-        ):
-            _train_guidance_data.append([step, t_v.item(), w_v.item(), l_v.item()])
+        )):
+            dn_v = dn_vals[i].item() if dn_vals is not None else 0.0
+            _train_guidance_data.append([step, t_v.item(), w_v.item(), l_v.item(), dn_v])
 
 
 # ---------------------------------------------------------------------------
@@ -341,10 +396,11 @@ def _log_sample_summary():
 
 
 def _log_train_guidance_graph():
-    """Scatter plots: w vs timestep and w vs lambda across all training steps."""
+    """Scatter plots: w vs timestep, w vs lambda, delta_norm vs timestep."""
     if not _train_guidance_data:
         return
-    table = wandb.Table(data=_train_guidance_data, columns=["step", "timestep", "w", "lambda"])
+    table = wandb.Table(data=_train_guidance_data,
+                        columns=["step", "timestep", "w", "lambda", "delta_norm"])
     _run.log({
         "charts/w_vs_timestep": wandb.plot.scatter(
             table, "timestep", "w",
@@ -353,6 +409,14 @@ def _log_train_guidance_graph():
         "charts/w_vs_lambda": wandb.plot.scatter(
             table, "lambda", "w",
             title="Guidance Scale (w) vs Lambda",
+        ),
+        "charts/delta_norm_vs_timestep": wandb.plot.scatter(
+            table, "timestep", "delta_norm",
+            title="||delta_t|| (v_uncond - v_text norm) vs Timestep",
+        ),
+        "charts/w_vs_delta_norm": wandb.plot.scatter(
+            table, "delta_norm", "w",
+            title="Guidance Scale (w) vs ||delta_t||",
         ),
     })
 
@@ -400,11 +464,58 @@ def _log_sample_guidance_graph():
             ),
         })
 
+        # Properly labeled chart using wandb.plot_table (y-axis shows "Guidance Scale (w)")
+        chart_rows = []
+        for lam_key in keys:
+            for d in lambda_trajs[lam_key]:
+                chart_rows.append([d["timestep"], d["guidance_scale"], lam_key])
+        chart_table = wandb.Table(
+            data=chart_rows,
+            columns=["Timestep", "Guidance Scale (w)", "Lambda"])
+        _run.log({
+            "charts/w_scale_vs_timestep": wandb.plot_table(
+                vega_spec_name="wandb/line/v0",
+                data_table=chart_table,
+                fields={"x": "Timestep", "y": "Guidance Scale (w)", "groupKeys": "Lambda"},
+                string_fields={"title": "Predicted Guidance Scale w(t, lambda)"},
+            ),
+        })
+
+        # Delta norm trajectories per lambda
+        dn_xs = [[d["timestep"] for d in lambda_trajs[k]] for k in keys]
+        dn_ys = [[d.get("delta_norm", 0) for d in lambda_trajs[k]] for k in keys]
+        _run.log({
+            "charts/delta_norm_trajectories": wandb.plot.line_series(
+                xs=dn_xs, ys=dn_ys, keys=keys,
+                title="||delta_t|| (v_uncond - v_text) vs Timestep (Sampling)",
+                xname="Timestep",
+            ),
+        })
+
+        # Properly labeled delta_norm chart
+        dn_chart_rows = []
+        for lam_key in keys:
+            for d in lambda_trajs[lam_key]:
+                dn_chart_rows.append([d["timestep"], d.get("delta_norm", 0), lam_key])
+        dn_chart_table = wandb.Table(
+            data=dn_chart_rows,
+            columns=["Timestep", "||delta_t|| (velocity diff norm)", "Lambda"])
+        _run.log({
+            "charts/delta_norm_vs_timestep": wandb.plot_table(
+                vega_spec_name="wandb/line/v0",
+                data_table=dn_chart_table,
+                fields={"x": "Timestep", "y": "||delta_t|| (velocity diff norm)", "groupKeys": "Lambda"},
+                string_fields={"title": "||delta_t|| vs Timestep (Sampling)"},
+            ),
+        })
+
     # Also log raw table for custom analysis
     rows = []
     for gen_idx, traj in enumerate(trajectories):
         for step_idx, d in enumerate(traj):
-            rows.append([gen_idx, step_idx, d["timestep"], d["guidance_scale"], d["lambda"]])
+            rows.append([gen_idx, step_idx, d["timestep"], d["guidance_scale"], d["lambda"],
+                        d.get("delta_norm", 0)])
     if rows:
-        table = wandb.Table(data=rows, columns=["generation", "step", "timestep", "guidance_scale", "lambda"])
+        table = wandb.Table(data=rows,
+                           columns=["generation", "step", "timestep", "guidance_scale", "lambda", "delta_norm"])
         _run.log({"sampling/guidance_data": table})

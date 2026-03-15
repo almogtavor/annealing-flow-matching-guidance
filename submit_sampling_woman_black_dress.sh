@@ -1,21 +1,22 @@
 #!/bin/bash
-#SBATCH --job-name=annealing-guidance-sample
+#SBATCH --job-name=fig2-compare
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=20G
-#SBATCH --time=04:00:00
-#SBATCH --output=logs/slurm_sample_%j.log
-#SBATCH --error=logs/slurm_sample_%j.log
+#SBATCH --mem=40G
+#SBATCH --time=02:00:00
+#SBATCH --output=logs/sampling/slurm_fig2_%j.log
+#SBATCH --error=logs/sampling/slurm_fig2_%j.log
 #SBATCH --partition=killable
+#SBATCH --nodelist=n-801,n-802,n-803,n-804,n-805,n-301,n-302,n-303,n-304,n-305,n-306,n-307,n-350
 
 set -euo pipefail
 
 PROJECT_DIR="/home/ML_courses/03683533_2025/or_tal_almog/almog/revised-annealing-guidance"
 cd "$PROJECT_DIR"
 
-mkdir -p logs
+mkdir -p logs/sampling
 
 # Keep ALL caches/tmp inside this repo
 TMP_ROOT="$PROJECT_DIR/tmp"
@@ -44,30 +45,32 @@ export TORCH_HOME="$TMP_ROOT/torch"
 export TORCH_EXTENSIONS_DIR="$TMP_ROOT/torch_extensions"
 mkdir -p "$TORCH_HOME" "$TORCH_EXTENSIONS_DIR"
 
-# Triton / CUDA compilation caches (if used)
+# Triton / CUDA compilation caches
 export TRITON_CACHE_DIR="$TMP_ROOT/triton"
 export CUDA_CACHE_PATH="$TMP_ROOT/nv_cache"
 mkdir -p "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH"
-
-# W&B (if enabled)
-export WANDB_DIR="$TMP_ROOT/wandb"
-export WANDB_CACHE_DIR="$TMP_ROOT/wandb_cache"
-export WANDB_DATA_DIR="$TMP_ROOT/wandb_data"
-mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR"
 
 # Matplotlib (avoid writing to $HOME)
 export MPLCONFIGDIR="$TMP_ROOT/matplotlib"
 mkdir -p "$MPLCONFIGDIR"
 
-# pip cache (avoid ~/.cache/pip)
+# pip cache
 export PIP_CACHE_DIR="$TMP_ROOT/pip_cache"
 mkdir -p "$PIP_CACHE_DIR"
 
-# Make sure logs are streamed to SLURM output
+# W&B
+export WANDB_DIR="$TMP_ROOT/wandb"
+export WANDB_CACHE_DIR="$TMP_ROOT/wandb_cache"
+export WANDB_DATA_DIR="$TMP_ROOT/wandb_data"
+mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR"
+export WANDB__REQUIRE_SERVICE=false
+
 export PYTHONUNBUFFERED=1
 
-# Default to fp16 for SLURM runs unless user explicitly disables it.
-export ANNEALING_GUIDANCE_FORCE_FP16="${ANNEALING_GUIDANCE_FORCE_FP16:-1}"
+# Load Hugging Face token from .env
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+    export $(grep -v '^#' "$PROJECT_DIR/.env" | grep -E 'HUGGINGFACE_HUB_TOKEN|HF_TOKEN' | xargs)
+fi
 
 DEPS_MARKER="$TMP_ROOT/deps_installed.ok"
 
@@ -94,10 +97,7 @@ PY
 ensure_requirements() {
 	"$PY" - <<'PY'
 try:
-    import diffusers  # noqa: F401
-    import transformers  # noqa: F401
-    import omegaconf  # noqa: F401
-    import dotenv  # noqa: F401
+    import diffusers, transformers, omegaconf, dotenv, sentencepiece, google.protobuf, matplotlib
 except Exception:
     raise SystemExit(1)
 raise SystemExit(0)
@@ -114,13 +114,11 @@ if ensure_torch && ensure_requirements; then
 else
 	"$PY" -m pip install -q --upgrade pip wheel setuptools
 	if ! ensure_torch; then
-		echo "Installing dependencies into venv (this may take a few minutes on first run)..."
-
+		echo "Installing dependencies into venv..."
 		TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
 		TORCH_VERSION="${TORCH_VERSION:-2.3.1+cu121}"
 		TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.18.1+cu121}"
 		TORCHAUDIO_VERSION="${TORCHAUDIO_VERSION:-2.3.1+cu121}"
-
 		"$PY" -m pip install --upgrade --index-url "$TORCH_INDEX_URL" \
 			"torch==${TORCH_VERSION}" \
 			"torchvision==${TORCHVISION_VERSION}" \
@@ -128,9 +126,24 @@ else
 	else
 		echo "Installing requirements into venv..."
 	fi
-
 	"$PY" -m pip install -r requirements_slurm.txt
 	touch "$DEPS_MARKER"
 fi
 
-"$PY" -u scripts/sample.py
+echo "Python: $($PY -V)"
+"$PY" - <<'PY'
+import torch, sys
+print('torch =', torch.__version__)
+print('cuda available =', torch.cuda.is_available())
+if not torch.cuda.is_available():
+    print("FATAL: CUDA not available. Exiting to avoid hanging on CPU.", file=sys.stderr)
+    sys.exit(1)
+print('gpu =', torch.cuda.get_device_name(0))
+PY
+
+CKPT="${FIG2_CHECKPOINT:-output/lr_1e-3/checkpoints_20260309_075609/checkpoint_step_20000.pt}"
+OUTPUT_DIR="${FIG2_OUTPUT_DIR:-results/fig2_comparison/$SLURM_JOB_ID}"
+
+"$PY" -u scripts/fig2_comparison.py \
+    --checkpoint "$CKPT" \
+    --output_dir "$OUTPUT_DIR"

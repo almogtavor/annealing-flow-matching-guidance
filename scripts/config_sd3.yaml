@@ -1,5 +1,4 @@
 seed: 42
-low_memory: true
 diffusion:
   model_id: stabilityai/stable-diffusion-3-medium-diffusers
   num_timesteps: 50
@@ -28,14 +27,14 @@ guidance_scale_model:
 
 training:
   save_interval: 200
-  max_steps: 20000
+  max_steps: 40000
   batch_size: 1
   accumulation_steps: 16
   out_dir: ./output
   image_root: src/data/laion/laion_pop_images/
   optimizer_kwargs:
     weight_decay: 0.01
-    lr: 0.0001
+    lr: 0.001
 
   prompt_noise:
     add_noise: true # Whether to add noise to prompt embeddings during training

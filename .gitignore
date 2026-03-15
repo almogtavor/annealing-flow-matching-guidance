@@ -81,3 +81,8 @@ temp/
 # Environment files (don't commit secrets)
 .env
 .env.local
+arXiv-2506.24108v1/
+.agents/
+AGENTS.md
+tests/
+.claude/

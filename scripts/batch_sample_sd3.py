@@ -95,6 +95,24 @@ NUM_INFERENCE_STEPS = 28
 GUIDANCE_SCALE = 7.0
 
 
+# ---------------------------------------------------------------------------
+# Multi-GPU helpers (no DDP — just split work across ranks via torchrun)
+# ---------------------------------------------------------------------------
+
+def _get_rank_info():
+    """Return (rank, world_size, local_rank) from torchrun env vars.
+    Falls back to (0, 1, 0) for single-GPU runs."""
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", local_rank))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    return rank, world_size, local_rank
+
+
+def _shard_work(items, rank, world_size):
+    """Return the slice of *items* that belongs to this rank."""
+    return [x for i, x in enumerate(items) if i % world_size == rank]
+
+
 def slugify(text, max_len=40):
     """Create a filesystem-safe slug from text."""
     import re
@@ -161,14 +179,15 @@ def create_figure_summary(fig_dir, fig_name, prompts, lambda_values, save_path):
     grid = Image.new('RGB', (grid_w, grid_h), 'white')
     draw = ImageDraw.Draw(grid)
 
-    # Draw column headers (lambda values)
+    # Draw column headers (lambda values + baselines)
     for j, lam in enumerate(lambda_values):
         x = row_label_w + j * (thumb_size + padding) + padding
-        if lam == "cfg":
-            label = "CFG"
+        if isinstance(lam, tuple):
+            # Baseline: (dir_name, label)
+            label = lam[1]
         elif lam == 0.0:
             label = "λ=0 (vanilla)"
-        elif lam == 0.0 or lam == 1.0:
+        elif lam == 1.0:
             label = f"λ={lam:.1f}"
         else:
             label = f"λ={lam:.2f}"
@@ -188,8 +207,9 @@ def create_figure_summary(fig_dir, fig_name, prompts, lambda_values, save_path):
 
         for j, lam in enumerate(lambda_values):
             x = row_label_w + j * (thumb_size + padding) + padding
-            if lam == "cfg":
-                img_path = os.path.join(prompt_dir, "cfg_baseline", f"seed_{SEED}.png")
+            if isinstance(lam, tuple):
+                # Baseline: (dir_name, label)
+                img_path = os.path.join(prompt_dir, lam[0], f"seed_{SEED}.png")
             else:
                 img_path = os.path.join(prompt_dir, f"lambda_{lam:.2f}", f"seed_{SEED}.png")
 
@@ -264,36 +284,59 @@ def load_pipeline_and_model(checkpoint_path, device, dtype):
     return pipeline, guidance_scale_model
 
 
-def generate_image(pipeline, guidance_scale_model, prompt, lambda_val, seed, device):
+def generate_image(pipeline, guidance_scale_model, prompt, lambda_val, seed, device,
+                    cached_embeds=None):
     """Generate a single image."""
     generator = torch.Generator(device=device).manual_seed(seed)
 
-    image = pipeline(
-        prompt=prompt,
+    kwargs = dict(
         guidance_scale=GUIDANCE_SCALE,
         num_inference_steps=NUM_INFERENCE_STEPS,
         generator=generator,
         use_annealing_guidance=True,
         guidance_scale_model=guidance_scale_model,
         guidance_lambda=lambda_val,
-    ).images[0]
+    )
+    if cached_embeds:
+        kwargs.update(prompt_embeds=cached_embeds[0].to(device),
+                      negative_prompt_embeds=cached_embeds[1].to(device),
+                      pooled_prompt_embeds=cached_embeds[2].to(device),
+                      negative_pooled_prompt_embeds=cached_embeds[3].to(device))
+    else:
+        kwargs["prompt"] = prompt
 
-    return image
+    return pipeline(**kwargs).images[0]
 
 
-def generate_cfg_baseline(pipeline, prompt, seed, device):
-    """Generate a single image using standard CFG (no annealing guidance)."""
+def generate_baseline(pipeline, prompt, seed, device, guidance_scale,
+                      use_cfgpp=False, cached_embeds=None):
+    """Generate a single image using standard CFG or CFG++ with a fixed guidance scale."""
     generator = torch.Generator(device=device).manual_seed(seed)
 
-    image = pipeline(
-        prompt=prompt,
-        guidance_scale=GUIDANCE_SCALE,
+    kwargs = dict(
+        guidance_scale=guidance_scale,
         num_inference_steps=NUM_INFERENCE_STEPS,
         generator=generator,
         use_annealing_guidance=False,
-    ).images[0]
+        use_cfgpp=use_cfgpp,
+    )
+    if cached_embeds:
+        kwargs.update(prompt_embeds=cached_embeds[0].to(device),
+                      negative_prompt_embeds=cached_embeds[1].to(device),
+                      pooled_prompt_embeds=cached_embeds[2].to(device),
+                      negative_pooled_prompt_embeds=cached_embeds[3].to(device))
+    else:
+        kwargs["prompt"] = prompt
 
-    return image
+    return pipeline(**kwargs).images[0]
+
+
+# Baseline configurations: (dir_name, label, guidance_scale, use_cfgpp)
+BASELINES = [
+    ("cfg_w7",    "CFG w=7",    7.0,  False),
+    ("cfg_w12",   "CFG w=12",   12.0, False),
+    ("cfgpp_w08", "CFG++ w=0.8", 0.8, True),
+]
 
 
 def main():
@@ -313,16 +356,25 @@ def main():
                         help='Specific lambda values. Default: 0.0 0.2 0.4 0.5 0.6 0.8 1.0')
     parser.add_argument('--force', action='store_true',
                         help='Overwrite existing images instead of skipping')
-    parser.add_argument('--cfg_baseline', action='store_true',
-                        help='Also generate standard CFG baseline images (no annealing guidance)')
+    parser.add_argument('--baselines', action='store_true',
+                        help='Also generate baseline images (CFG w=7, CFG w=12, CFG++ w=0.8)')
     args = parser.parse_args()
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if not torch.cuda.is_available():
+        print("FATAL: CUDA not available. Refusing to run on CPU (float16 will hang).")
+        sys.exit(1)
+
+    rank, world_size, local_rank = _get_rank_info()
+    torch.cuda.set_device(local_rank)
+    device = f'cuda:{local_rank}'
     dtype = torch.float16
 
-    print(f"Device: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    # Suppress prints on non-main ranks
+    if rank != 0:
+        import builtins
+        builtins.print = lambda *a, **kw: None
+
+    print(f"[GPU {world_size}x] Device: {device} — {torch.cuda.get_device_name(local_rank)}")
 
     # Resolve checkpoint path
     checkpoint_path = args.checkpoint
@@ -334,7 +386,24 @@ def main():
         sys.exit(1)
 
     pipeline, guidance_scale_model = load_pipeline_and_model(checkpoint_path, device, dtype)
-    wb.init_sampling(vars(args), guidance_scale_model)
+    if rank == 0:
+        wb.init_sampling(vars(args), guidance_scale_model)
+
+    # Pre-encode all unique prompts once (avoids re-running T5-XXL per lambda)
+    all_unique_prompts = list({p for prompts in PROMPTS_BY_FIGURE.values() for _, p in prompts})
+    print(f"Pre-encoding {len(all_unique_prompts)} unique prompts...")
+    prompt_embed_cache = {}
+    with torch.no_grad():
+        for i, p in enumerate(all_unique_prompts):
+            pe, npe, ppe, nppe = pipeline.encode_prompt(
+                prompt=p, prompt_2=None, prompt_3=None,
+                device=device, num_images_per_prompt=1, do_classifier_free_guidance=True)
+            prompt_embed_cache[p] = (pe.cpu(), npe.cpu(), ppe.cpu(), nppe.cpu())
+            if (i + 1) % 10 == 0:
+                print(f"  Encoded {i+1}/{len(all_unique_prompts)} prompts")
+    print(f"Prompt encoding done. Freeing T5 encoder...")
+    del pipeline.text_encoder_3
+    torch.cuda.empty_cache()
 
     # Determine output root
     output_root = os.path.join(_REPO_ROOT, args.output_root, args.checkpoint_id)
@@ -344,174 +413,188 @@ def main():
     figures_to_process = args.figures if args.figures else list(PROMPTS_BY_FIGURE.keys())
     lambda_values = args.lambdas if args.lambdas else LAMBDA_VALUES
     prompt_filter = set(args.prompts) if args.prompts else None
-    n_prompts = sum(1 for fn in figures_to_process if fn in PROMPTS_BY_FIGURE for pid, _ in PROMPTS_BY_FIGURE[fn] if prompt_filter is None or pid in prompt_filter)
-    cfg_extra = n_prompts if args.cfg_baseline else 0
-    total_expected = sum(len(lambda_values) for fn in figures_to_process if fn in PROMPTS_BY_FIGURE for pid, _ in PROMPTS_BY_FIGURE[fn] if prompt_filter is None or pid in prompt_filter) + cfg_extra
-    image_counter = 0
 
-    # Track all generated images for summary
-    all_prompt_data = []
+    # Build flat work list: [(fig_name, prompt_id, prompt_text, task_type, task_info), ...]
+    # task_type: "lambda" or "baseline"
+    # task_info: lambda_val (float) or (bl_dir_name, bl_label, bl_w, bl_cfgpp) tuple
+    all_work = []
+    for fig_name in figures_to_process:
+        if fig_name not in PROMPTS_BY_FIGURE:
+            continue
+        for prompt_id, prompt_text in PROMPTS_BY_FIGURE[fig_name]:
+            if prompt_filter and prompt_id not in prompt_filter:
+                continue
+            for lam in lambda_values:
+                all_work.append((fig_name, prompt_id, prompt_text, "lambda", lam))
+            if args.baselines:
+                for bl in BASELINES:
+                    all_work.append((fig_name, prompt_id, prompt_text, "baseline", bl))
+
+    # Shard work across GPUs
+    my_work = _shard_work(all_work, rank, world_size)
+    total_expected = len(my_work)
+    image_counter = 0
     total_images = 0
     start_time = datetime.datetime.now()
 
     print(f"\n{'='*60}")
     print(f"Batch Generation Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Output: {output_root}")
-    print(f"Figures: {figures_to_process}")
+    print(f"Total work items: {len(all_work)} across {world_size} GPU(s)")
     print(f"Lambdas: {lambda_values}")
     print(f"Seed: {SEED}")
     print(f"{'='*60}\n")
 
-    for fig_name in figures_to_process:
-        if fig_name not in PROMPTS_BY_FIGURE:
-            print(f"Warning: Unknown figure {fig_name}, skipping...")
-            continue
-
-        prompts = PROMPTS_BY_FIGURE[fig_name]
+    for fig_name, prompt_id, prompt_text, task_type, task_info in my_work:
         fig_dir = os.path.join(output_root, fig_name)
         os.makedirs(fig_dir, exist_ok=True)
+        prompt_slug = slugify(prompt_text)
+        prompt_dir_name = f"prompt_{prompt_id:03d}_{prompt_slug}"
+        prompt_dir = os.path.join(fig_dir, prompt_dir_name)
+        os.makedirs(prompt_dir, exist_ok=True)
 
-        print(f"\n--- Processing {fig_name} ({len(prompts)} prompts) ---")
+        if task_type == "lambda":
+            lam = task_info
+            lambda_dir = os.path.join(prompt_dir, f"lambda_{lam:.2f}")
+            os.makedirs(lambda_dir, exist_ok=True)
+            image_path = os.path.join(lambda_dir, f"seed_{SEED}.png")
+            meta_path = os.path.join(lambda_dir, "meta.json")
 
-        for prompt_id, prompt_text in prompts:
-            if prompt_filter and prompt_id not in prompt_filter:
+            if os.path.exists(image_path) and not args.force:
+                print(f"  prompt {prompt_id} λ={lam:.2f} - exists, skipping")
+                image_counter += 1
                 continue
 
-            prompt_slug = slugify(prompt_text)
-            prompt_dir_name = f"prompt_{prompt_id:03d}_{prompt_slug}"
-            prompt_dir = os.path.join(fig_dir, prompt_dir_name)
-            os.makedirs(prompt_dir, exist_ok=True)
+            img_t0 = datetime.datetime.now()
+            try:
+                image = generate_image(
+                    pipeline, guidance_scale_model,
+                    prompt_text, lam, SEED, device,
+                    cached_embeds=prompt_embed_cache.get(prompt_text),
+                )
+                image.save(image_path)
+                meta = {
+                    "prompt_id": prompt_id, "prompt": prompt_text,
+                    "lambda": lam, "seed": SEED,
+                    "guidance_scale": GUIDANCE_SCALE,
+                    "num_inference_steps": NUM_INFERENCE_STEPS,
+                    "checkpoint": args.checkpoint,
+                    "timestamp": datetime.datetime.now().isoformat(),
+                }
+                with open(meta_path, 'w') as f:
+                    json.dump(meta, f, indent=2)
+                total_images += 1
+                image_counter += 1
+                img_sec = (datetime.datetime.now() - img_t0).total_seconds()
+                print(f"  prompt {prompt_id} λ={lam:.2f} | {img_sec:.1f}s | {image_counter}/{total_expected}", flush=True)
+            except Exception as e:
+                print(f"  [R{rank}] ERROR prompt {prompt_id} λ={lam:.2f}: {e}")
+                image_counter += 1
 
-            print(f"\n  Prompt {prompt_id}: {prompt_text[:50]}...")
+        else:  # baseline
+            bl_dir_name, bl_label, bl_w, bl_cfgpp = task_info
+            bl_dir = os.path.join(prompt_dir, bl_dir_name)
+            os.makedirs(bl_dir, exist_ok=True)
+            bl_image_path = os.path.join(bl_dir, f"seed_{SEED}.png")
+            bl_meta_path = os.path.join(bl_dir, "meta.json")
 
-            images_for_grid = []
-            labels_for_grid = []
+            if os.path.exists(bl_image_path) and not args.force:
+                print(f"  prompt {prompt_id} {bl_label} - exists, skipping")
+                image_counter += 1
+                continue
 
-            for lam in lambda_values:
-                lambda_dir = os.path.join(prompt_dir, f"lambda_{lam:.2f}")
-                os.makedirs(lambda_dir, exist_ok=True)
+            bl_t0 = datetime.datetime.now()
+            try:
+                bl_img = generate_baseline(
+                    pipeline, prompt_text, SEED, device,
+                    guidance_scale=bl_w, use_cfgpp=bl_cfgpp,
+                    cached_embeds=prompt_embed_cache.get(prompt_text),
+                )
+                bl_img.save(bl_image_path)
+                bl_meta = {
+                    "prompt_id": prompt_id, "prompt": prompt_text,
+                    "type": bl_dir_name, "label": bl_label, "seed": SEED,
+                    "guidance_scale": bl_w, "use_cfgpp": bl_cfgpp,
+                    "num_inference_steps": NUM_INFERENCE_STEPS,
+                    "timestamp": datetime.datetime.now().isoformat(),
+                }
+                with open(bl_meta_path, 'w') as f:
+                    json.dump(bl_meta, f, indent=2)
+                total_images += 1
+                image_counter += 1
+                bl_sec = (datetime.datetime.now() - bl_t0).total_seconds()
+                print(f"  prompt {prompt_id} {bl_label} | {bl_sec:.1f}s | {image_counter}/{total_expected}", flush=True)
+            except Exception as e:
+                print(f"  [R{rank}] ERROR prompt {prompt_id} {bl_label}: {e}")
+                image_counter += 1
 
-                image_path = os.path.join(lambda_dir, f"seed_{SEED}.png")
-                meta_path = os.path.join(lambda_dir, "meta.json")
+    # --- Barrier: wait for all ranks before summaries ---
+    if world_size > 1:
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            dist.init_process_group("nccl")
+        dist.barrier()
 
-                # Skip if already exists (unless --force)
-                if os.path.exists(image_path) and not args.force:
-                    print(f"    lambda={lam:.2f} - exists, skipping")
-                    img = Image.open(image_path)
-                    images_for_grid.append(img)
-                    labels_for_grid.append(f"λ={lam:.2f}")
+    # Only rank 0 creates grids and summaries
+    if rank == 0:
+        all_prompt_data = []
+        for fig_name in figures_to_process:
+            if fig_name not in PROMPTS_BY_FIGURE:
+                continue
+            prompts = PROMPTS_BY_FIGURE[fig_name]
+            fig_dir = os.path.join(output_root, fig_name)
+
+            for prompt_id, prompt_text in prompts:
+                if prompt_filter and prompt_id not in prompt_filter:
                     continue
+                prompt_slug = slugify(prompt_text)
+                prompt_dir_name = f"prompt_{prompt_id:03d}_{prompt_slug}"
+                prompt_dir = os.path.join(fig_dir, prompt_dir_name)
 
-                img_t0 = datetime.datetime.now()
-                try:
-                    image = generate_image(
-                        pipeline, guidance_scale_model,
-                        prompt_text, lam, SEED, device
-                    )
-                    image.save(image_path)
+                # Build grid from saved images
+                images_for_grid, labels_for_grid = [], []
+                for lam in lambda_values:
+                    img_path = os.path.join(prompt_dir, f"lambda_{lam:.2f}", f"seed_{SEED}.png")
+                    if os.path.exists(img_path):
+                        images_for_grid.append(Image.open(img_path))
+                        labels_for_grid.append(f"λ={lam:.2f}")
+                if args.baselines:
+                    for bl_dir_name, bl_label, _, _ in BASELINES:
+                        img_path = os.path.join(prompt_dir, bl_dir_name, f"seed_{SEED}.png")
+                        if os.path.exists(img_path):
+                            images_for_grid.append(Image.open(img_path))
+                            labels_for_grid.append(bl_label)
 
-                    # Save metadata
-                    meta = {
-                        "prompt_id": prompt_id,
-                        "prompt": prompt_text,
-                        "lambda": lam,
-                        "seed": SEED,
-                        "guidance_scale": GUIDANCE_SCALE,
-                        "num_inference_steps": NUM_INFERENCE_STEPS,
-                        "checkpoint": args.checkpoint,
-                        "timestamp": datetime.datetime.now().isoformat(),
-                    }
-                    with open(meta_path, 'w') as f:
-                        json.dump(meta, f, indent=2)
+                if images_for_grid:
+                    grid_path = os.path.join(prompt_dir, "grid.png")
+                    create_grid(images_for_grid, labels_for_grid, grid_path)
+                    print(f"  Grid saved: {grid_path}")
 
-                    images_for_grid.append(image)
-                    labels_for_grid.append(f"λ={lam:.2f}")
-                    total_images += 1
-                    image_counter += 1
-                    img_sec = (datetime.datetime.now() - img_t0).total_seconds()
-                    print(f"    λ={lam:.2f} | {NUM_INFERENCE_STEPS} steps in {img_sec:.1f}s ({img_sec/NUM_INFERENCE_STEPS:.3f}s/step) | image {image_counter}/{total_expected}", flush=True)
+                all_prompt_data.append({
+                    "prompt_id": prompt_id, "prompt": prompt_text,
+                    "figure": fig_name, "directory": prompt_dir_name,
+                })
 
-                except Exception as e:
-                    print(f"ERROR: {e}")
-                    continue
+            # Figure summary grid
+            fig_prompts = [(pid, pt) for pid, pt in prompts
+                           if prompt_filter is None or pid in prompt_filter]
+            if fig_prompts:
+                summary_lambdas = list(lambda_values) + ([(bl[0], bl[1]) for bl in BASELINES] if args.baselines else [])
+                summary_path = os.path.join(fig_dir, f"{fig_name}_summary.png")
+                create_figure_summary(fig_dir, fig_name, fig_prompts, summary_lambdas, summary_path)
 
-            # Generate CFG baseline (standard CFG without annealing guidance)
-            if args.cfg_baseline:
-                cfg_dir = os.path.join(prompt_dir, "cfg_baseline")
-                os.makedirs(cfg_dir, exist_ok=True)
-                cfg_image_path = os.path.join(cfg_dir, f"seed_{SEED}.png")
-                cfg_meta_path = os.path.join(cfg_dir, "meta.json")
-
-                if os.path.exists(cfg_image_path) and not args.force:
-                    print(f"    CFG baseline - exists, skipping")
-                    cfg_img = Image.open(cfg_image_path)
-                    images_for_grid.append(cfg_img)
-                    labels_for_grid.append("CFG")
-                else:
-                    cfg_t0 = datetime.datetime.now()
-                    try:
-                        cfg_img = generate_cfg_baseline(
-                            pipeline, prompt_text, SEED, device
-                        )
-                        cfg_img.save(cfg_image_path)
-
-                        cfg_meta = {
-                            "prompt_id": prompt_id,
-                            "prompt": prompt_text,
-                            "type": "cfg_baseline",
-                            "seed": SEED,
-                            "guidance_scale": GUIDANCE_SCALE,
-                            "num_inference_steps": NUM_INFERENCE_STEPS,
-                            "timestamp": datetime.datetime.now().isoformat(),
-                        }
-                        with open(cfg_meta_path, 'w') as f:
-                            json.dump(cfg_meta, f, indent=2)
-
-                        images_for_grid.append(cfg_img)
-                        labels_for_grid.append("CFG")
-                        total_images += 1
-                        image_counter += 1
-                        cfg_sec = (datetime.datetime.now() - cfg_t0).total_seconds()
-                        print(f"    CFG baseline | {NUM_INFERENCE_STEPS} steps in {cfg_sec:.1f}s | image {image_counter}/{total_expected}", flush=True)
-
-                    except Exception as e:
-                        print(f"ERROR generating CFG baseline: {e}")
-
-            # Create grid for this prompt
-            if images_for_grid:
-                grid_path = os.path.join(prompt_dir, "grid.png")
-                create_grid(images_for_grid, labels_for_grid, grid_path)
-                print(f"    Grid saved: {grid_path}")
-
-            all_prompt_data.append({
-                "prompt_id": prompt_id,
-                "prompt": prompt_text,
-                "figure": fig_name,
-                "directory": prompt_dir_name,
-            })
-
-        # Create figure summary grid
-        fig_prompts = [(pid, pt) for pid, pt in prompts
-                       if prompt_filter is None or pid in prompt_filter]
-        if fig_prompts:
-            summary_lambdas = list(lambda_values) + (["cfg"] if args.cfg_baseline else [])
-            summary_path = os.path.join(fig_dir, f"{fig_name}_summary.png")
-            create_figure_summary(fig_dir, fig_name, fig_prompts, summary_lambdas, summary_path)
-
-    # Create summary directory
-    summary_dir = os.path.join(output_root, "summary")
-    os.makedirs(summary_dir, exist_ok=True)
-
-    # Save prompt index
-    index_path = os.path.join(summary_dir, "prompt_index.json")
-    with open(index_path, 'w') as f:
-        json.dump({
-            "prompts": all_prompt_data,
-            "lambda_values": lambda_values,
-            "seed": SEED,
-            "checkpoint": args.checkpoint,
-            "generated_at": datetime.datetime.now().isoformat(),
-        }, f, indent=2)
+        # Save prompt index
+        summary_dir = os.path.join(output_root, "summary")
+        os.makedirs(summary_dir, exist_ok=True)
+        index_path = os.path.join(summary_dir, "prompt_index.json")
+        with open(index_path, 'w') as f:
+            json.dump({
+                "prompts": all_prompt_data,
+                "lambda_values": lambda_values,
+                "seed": SEED,
+                "checkpoint": args.checkpoint,
+                "generated_at": datetime.datetime.now().isoformat(),
+            }, f, indent=2)
 
     end_time = datetime.datetime.now()
     duration = end_time - start_time
@@ -519,12 +602,15 @@ def main():
     print(f"\n{'='*60}")
     print(f"BATCH GENERATION COMPLETE")
     print(f"{'='*60}")
-    print(f"Total images generated: {total_images}")
+    print(f"Images generated: {total_images}")
     print(f"Duration: {duration}")
     print(f"Output directory: {output_root}")
-    print(f"Summary: {summary_dir}")
     print(f"{'='*60}\n")
-    wb.finish()
+    if rank == 0:
+        wb.finish()
+
+    if world_size > 1 and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

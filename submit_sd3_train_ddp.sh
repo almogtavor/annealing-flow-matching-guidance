@@ -1,15 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=sd3-batch
+#SBATCH --job-name=sd3-ddp
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=160G
-#SBATCH --time=12:00:00
-#SBATCH --output=logs/slurm_sd3_batch_%j.log
-#SBATCH --error=logs/slurm_sd3_batch_%j.log
+#SBATCH --gpus-per-node=2
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=128G
+#SBATCH --time=24:00:00
+#SBATCH --output=logs/ddp/slurm_sd3_ddp_%j.log
+#SBATCH --error=logs/ddp/slurm_sd3_ddp_%j.log
 #SBATCH --partition=killable
-#SBATCH --nodelist=n-301,n-302,n-303,n-304,n-305,n-306,n-307,n-350,n-801,n-802,n-803,n-804
+#SBATCH --nodelist=n-801,n-802,n-804,n-805,n-601,n-602
 
 set -euo pipefail
 
@@ -18,21 +18,17 @@ cd "$PROJECT_DIR"
 
 mkdir -p logs
 
-# Keep ALL caches/tmp inside this repo
 TMP_ROOT="$PROJECT_DIR/tmp"
 mkdir -p "$TMP_ROOT"
 
-# Temp dirs
 export TMPDIR="$TMP_ROOT/tmpdir"
 export TMP="$TMPDIR"
 export TEMP="$TMPDIR"
 mkdir -p "$TMPDIR"
 
-# XDG base cache
 export XDG_CACHE_HOME="$TMP_ROOT/xdg_cache"
 mkdir -p "$XDG_CACHE_HOME"
 
-# Hugging Face caches
 export HF_HOME="$TMP_ROOT/hf"
 export HF_DATASETS_CACHE="$HF_HOME/datasets"
 export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
@@ -40,25 +36,25 @@ export TRANSFORMERS_CACHE="$HF_HOME/transformers"
 export DIFFUSERS_CACHE="$HF_HOME/diffusers"
 mkdir -p "$HF_DATASETS_CACHE" "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE" "$DIFFUSERS_CACHE"
 
-# PyTorch / extensions caches
 export TORCH_HOME="$TMP_ROOT/torch"
 export TORCH_EXTENSIONS_DIR="$TMP_ROOT/torch_extensions"
 mkdir -p "$TORCH_HOME" "$TORCH_EXTENSIONS_DIR"
 
-# Triton / CUDA compilation caches
 export TRITON_CACHE_DIR="$TMP_ROOT/triton"
 export CUDA_CACHE_PATH="$TMP_ROOT/nv_cache"
 mkdir -p "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH"
 
-# Matplotlib
 export MPLCONFIGDIR="$TMP_ROOT/matplotlib"
 mkdir -p "$MPLCONFIGDIR"
 
-# pip cache
 export PIP_CACHE_DIR="$TMP_ROOT/pip_cache"
 mkdir -p "$PIP_CACHE_DIR"
 
-# Stream output
+# NCCL tuning — P2P can fail on mixed-GPU nodes (L40S, RTX 3090)
+export NCCL_P2P_DISABLE=1
+export NCCL_IB_DISABLE=1
+export NCCL_DEBUG=WARN
+
 export PYTHONUNBUFFERED=1
 
 # Load Hugging Face token from .env
@@ -66,7 +62,7 @@ if [[ -f "$PROJECT_DIR/.env" ]]; then
     export $(grep -v '^#' "$PROJECT_DIR/.env" | grep -E 'HUGGINGFACE_HUB_TOKEN|HF_TOKEN' | xargs)
 fi
 
-DEPS_MARKER="$TMP_ROOT/deps_batch_installed.ok"
+DEPS_MARKER="$TMP_ROOT/deps_sd3_train_installed.ok"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 ENV_DIR="${ENV_DIR:-$PROJECT_DIR/venv}"
@@ -81,7 +77,7 @@ PY="$ENV_DIR/bin/python"
 ensure_torch() {
 	"$PY" - <<'PY'
 try:
-    import torch
+    import torch  # noqa: F401
 except Exception:
     raise SystemExit(1)
 raise SystemExit(0)
@@ -91,13 +87,12 @@ PY
 ensure_requirements() {
 	"$PY" - <<'PY'
 try:
-    import diffusers
-    import transformers
-    import omegaconf
-    import dotenv
-    import sentencepiece
-    import google.protobuf
-    from PIL import Image, ImageDraw, ImageFont
+    import diffusers  # noqa: F401
+    import transformers  # noqa: F401
+    import omegaconf  # noqa: F401
+    import dotenv  # noqa: F401
+    import sentencepiece  # noqa: F401
+    import google.protobuf  # noqa: F401
 except Exception:
     raise SystemExit(1)
 raise SystemExit(0)
@@ -114,7 +109,7 @@ if ensure_torch && ensure_requirements; then
 else
 	"$PY" -m pip install -q --upgrade pip wheel setuptools
 	if ! ensure_torch; then
-		echo "Installing dependencies into venv..."
+		echo "Installing PyTorch into venv..."
 
 		TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
 		TORCH_VERSION="${TORCH_VERSION:-2.3.1+cu121}"
@@ -144,22 +139,29 @@ if not torch.cuda.is_available():
 print('gpu =', torch.cuda.get_device_name(0))
 PY
 
-echo ""
-echo "Starting batch image generation..."
-echo "============================================"
-
-NGPUS="${SLURM_GPUS_ON_NODE:-4}"
-TORCHRUN="$ENV_DIR/bin/torchrun"
-if [[ ! -x "$TORCHRUN" ]]; then
-    TORCHRUN="$PY -m torch.distributed.run"
+# Verify real dataset exists — do NOT fall back to dummy data
+DEFAULT_IMAGE_ROOT="$PROJECT_DIR/src/data/laion/laion_pop_images"
+if [[ ! -d "$DEFAULT_IMAGE_ROOT" ]]; then
+	echo "ERROR: Dataset not found at $DEFAULT_IMAGE_ROOT"
+	echo "Run: sbatch submit_download_laion.sh to download dataset"
+	exit 1
 fi
 
-# Run batch sampling across GPUs - pass any extra arguments
-$TORCHRUN --nproc_per_node="$NGPUS" --standalone \
-    scripts/batch_sample_sd3.py \
-    --checkpoint "/home/ML_courses/03683533_2025/or_tal_almog/almog/revised-annealing-guidance/output/checkpoints_sd3_20260224_020326/checkpoint_final.pt" \
-    --checkpoint_id "sd3_cfgpp_v1" \
-    --output_root "results/images" \
-    --lambdas 0.0 0.2 0.4 0.6 0.8 1.0 \
-    --force \
-    "$@"
+# rack-omerl-g01: GPU 1 (PCI 3E:00.0) is broken — filter it out to prevent
+# CUDA runtime initialization failure that poisons all GPUs.
+if [[ "$(hostname)" == "rack-omerl-g01" && -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    export CUDA_VISIBLE_DEVICES=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | grep -v '^1$' | paste -sd,)
+    echo "rack-omerl-g01: filtered broken GPU 1, CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+fi
+
+# Auto-detect GPU count from SLURM allocation (falls back to 2)
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    NGPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+else
+    NGPUS=2
+fi
+NPROC="${NPROC:-$NGPUS}"
+echo "Starting SD3 DDP training with $NPROC GPUs..."
+echo "Config: ${ANNEALING_GUIDANCE_CONFIG:-scripts/config_sd3.yaml}"
+ANNEALING_GUIDANCE_CONFIG="${ANNEALING_GUIDANCE_CONFIG:-scripts/config_sd3.yaml}" \
+    "$PY" -m torch.distributed.run --nproc_per_node="$NPROC" scripts/train.py

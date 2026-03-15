@@ -1,5 +1,4 @@
 seed: 42
-low_memory: true
 diffusion:
   model_id: stabilityai/stable-diffusion-3-medium-diffusers
   num_timesteps: 50

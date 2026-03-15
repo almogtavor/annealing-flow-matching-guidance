@@ -4,12 +4,12 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=40G
+#SBATCH --mem=64G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/slurm_sd3_train_%j.log
-#SBATCH --error=logs/slurm_sd3_train_%j.log
+#SBATCH --output=logs/trainings/slurm_sd3_train_%j.log
+#SBATCH --error=logs/trainings/slurm_sd3_train_%j.log
 #SBATCH --partition=killable
-#SBATCH --nodelist=n-301,n-302,n-303,n-304,n-305,n-306,n-307,n-350
+#SBATCH --nodelist=n-801,n-802,n-803,n-804,n-805,n-601,n-602
 
 set -euo pipefail
 
@@ -125,9 +125,13 @@ fi
 
 echo "Python: $($PY -V)"
 "$PY" - <<'PY'
-import torch
+import torch, sys
 print('torch =', torch.__version__)
 print('cuda available =', torch.cuda.is_available())
+if not torch.cuda.is_available():
+    print("FATAL: CUDA not available. Exiting to avoid hanging on CPU.", file=sys.stderr)
+    sys.exit(1)
+print('gpu =', torch.cuda.get_device_name(0))
 PY
 
 # Verify real dataset exists — do NOT fall back to dummy data

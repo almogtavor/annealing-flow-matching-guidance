@@ -16,7 +16,10 @@ hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
 if hf_token and "HF_TOKEN" not in os.environ:
     os.environ["HF_TOKEN"] = hf_token
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+if not torch.cuda.is_available():
+    print("FATAL: CUDA not available. Refusing to run on CPU (float16 will hang).")
+    sys.exit(1)
+device = 'cuda'
 dtype = torch.float16
 
 print(f"Using device: {device}")

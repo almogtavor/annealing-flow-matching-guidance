@@ -9,7 +9,10 @@ if _REPO_ROOT not in sys.path:
 
 import src.utils.model_utils as model_utils
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+if not torch.cuda.is_available():
+    print("FATAL: CUDA not available. Refusing to run on CPU.")
+    sys.exit(1)
+device = 'cuda'
 # =====================
 #      CFG SECTION
 # =====================
