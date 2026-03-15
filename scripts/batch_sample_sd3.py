@@ -333,6 +333,7 @@ def generate_baseline(pipeline, prompt, seed, device, guidance_scale,
 
 # Baseline configurations: (dir_name, label, guidance_scale, use_cfgpp)
 BASELINES = [
+    ("cfg_w3.5",  "CFG w=3.5",  3.5,  False),
     ("cfg_w7",    "CFG w=7",    7.0,  False),
     ("cfg_w12",   "CFG w=12",   12.0, False),
     ("cfgpp_w08", "CFG++ w=0.8", 0.8, True),

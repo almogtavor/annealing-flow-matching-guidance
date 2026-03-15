@@ -142,14 +142,19 @@ def init_sampling(config_dict, guidance_model=None):
     parts.append(ckpt_id)
     run_name = "_".join(parts)
 
-    _run = wandb.init(
-        entity="annealing-guidance",
-        project="annealing-guidance",
-        job_type="sample",
-        name=run_name,
-        config=config_dict,
-        settings=wandb.Settings(start_method="thread"),
-    )
+    try:
+        _run = wandb.init(
+            entity="annealing-guidance",
+            project="annealing-guidance",
+            job_type="sample",
+            name=run_name,
+            config=config_dict,
+            settings=wandb.Settings(start_method="thread"),
+        )
+    except Exception as e:
+        print(f"WARNING: wandb.init failed ({e}); continuing without W&B logging.", flush=True)
+        _run = None
+        return None
 
     if guidance_model is not None:
         _register_sample_hook(guidance_model)

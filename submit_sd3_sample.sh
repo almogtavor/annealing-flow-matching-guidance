@@ -170,7 +170,7 @@ if [[ -n "$CKPT" && -n "$CKPT_ID" ]]; then
         scripts/batch_sample_sd3.py \
         --checkpoint "$CKPT" --checkpoint_id "$CKPT_ID" \
         --output_root "$OUTPUT_ROOT" \
-        --baselines --force
+        --baselines --force "$@"
 
     # Generate analysis plots (single GPU, fast)
     W_PLOT_DIR="$OUTPUT_ROOT/$CKPT_ID"
