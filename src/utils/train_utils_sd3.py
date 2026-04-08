@@ -32,7 +32,9 @@ def load_models(config, device):
     if hasattr(pipeline.transformer, 'enable_gradient_checkpointing'):
         pipeline.transformer.enable_gradient_checkpointing()
 
-    model = ScalarMLP(**config['guidance_scale_model'])
+    mlp_kwargs = dict(config['guidance_scale_model'])
+    mlp_kwargs.setdefault('num_timesteps', config['diffusion'].get('num_timesteps'))
+    model = ScalarMLP(**mlp_kwargs)
     model.to(device, dtype=torch.float32)
     model.device, model.dtype = device, torch.float32
     return pipeline, model

@@ -305,7 +305,7 @@ def load_pipeline_and_model(checkpoint_path, device, dtype, auto_lambda=False):
         delta_embed_dim=model_cfg.get('delta_embed_dim', 4),
         lambda_embed_dim=model_cfg.get('lambda_embed_dim', 4),
         t_embed_normalization=model_cfg.get('t_embed_normalization', 1e3),
-        num_timesteps=model_cfg.get('num_timesteps'),
+        num_timesteps=model_cfg.get('num_timesteps') or checkpoint.get('config', {}).get('diffusion', {}).get('num_timesteps'),
         delta_embed_normalization=model_cfg.get('delta_embed_normalization', 5.0),
         w_bias=model_cfg.get('w_bias', 1.0),
         w_scale=model_cfg.get('w_scale', 1.0),
@@ -343,6 +343,32 @@ def generate_image(pipeline, guidance_scale_model, prompt, lambda_val, seed, dev
         use_annealing_guidance=True,
         guidance_scale_model=guidance_scale_model,
         guidance_lambda=lambda_val,
+    )
+    if cached_embeds:
+        kwargs.update(prompt_embeds=cached_embeds[0].to(device),
+                      negative_prompt_embeds=cached_embeds[1].to(device),
+                      pooled_prompt_embeds=cached_embeds[2].to(device),
+                      negative_pooled_prompt_embeds=cached_embeds[3].to(device))
+    else:
+        kwargs["prompt"] = prompt
+
+    return pipeline(**kwargs).images[0]
+
+
+def generate_fsg(pipeline, guidance_scale_model, prompt, lambda_val, seed, device,
+                 fsg_iterations=3, cached_embeds=None):
+    """Generate a single image using FSG (Fixed-point Stochastic Guidance)."""
+    generator = torch.Generator(device="cuda:0").manual_seed(seed)
+
+    kwargs = dict(
+        guidance_scale=GUIDANCE_SCALE,
+        num_inference_steps=NUM_INFERENCE_STEPS,
+        generator=generator,
+        use_annealing_guidance=True,
+        guidance_scale_model=guidance_scale_model,
+        guidance_lambda=lambda_val,
+        use_fsg=True,
+        fsg_iterations=fsg_iterations,
     )
     if cached_embeds:
         kwargs.update(prompt_embeds=cached_embeds[0].to(device),
@@ -490,9 +516,9 @@ def main():
     prompt_filter = set(args.prompts) if args.prompts else None
 
     # Build flat work list: [(fig_name, prompt_id, prompt_text, task_type, task_info), ...]
-    # task_type: "lambda", "baseline", or "auto_lambda"
-    # task_info: lambda_val (float), (bl_dir_name, bl_label, bl_w, bl_cfgpp) tuple, or None
+    # task_type: "lambda", "baseline", "auto_lambda", "fsg", "fsg_auto_lambda"
     all_work = []
+    FSG_LAMBDA = 0.4
     for fig_name in figures_to_process:
         if fig_name not in PROMPTS_BY_FIGURE:
             continue
@@ -503,6 +529,10 @@ def main():
                 all_work.append((fig_name, prompt_id, prompt_text, "lambda", lam))
             if args.auto_lambda:
                 all_work.append((fig_name, prompt_id, prompt_text, "auto_lambda", None))
+            # FSG variants (always included)
+            all_work.append((fig_name, prompt_id, prompt_text, "fsg", FSG_LAMBDA))
+            if args.auto_lambda:
+                all_work.append((fig_name, prompt_id, prompt_text, "fsg_auto_lambda", None))
             if args.baselines:
                 for bl in BASELINES:
                     all_work.append((fig_name, prompt_id, prompt_text, "baseline", bl))
@@ -607,6 +637,51 @@ def main():
                 print(f"  [R{rank}] ERROR prompt {prompt_id} auto_lambda: {e}")
                 image_counter += 1
 
+        elif task_type in ("fsg", "fsg_auto_lambda"):
+            is_fsg_auto = task_type == "fsg_auto_lambda"
+            fsg_dir_name = "fsg_auto_lambda" if is_fsg_auto else f"fsg_lambda_{task_info:.2f}"
+            fsg_label = "FSG auto-λ" if is_fsg_auto else f"FSG λ={task_info:.2f}"
+            fsg_dir = os.path.join(prompt_dir, fsg_dir_name)
+            os.makedirs(fsg_dir, exist_ok=True)
+            fsg_image_path = os.path.join(fsg_dir, f"seed_{SEED}.png")
+            fsg_meta_path = os.path.join(fsg_dir, "meta.json")
+
+            if os.path.exists(fsg_image_path) and not args.force:
+                print(f"  prompt {prompt_id} {fsg_label} - exists, skipping")
+                image_counter += 1
+                continue
+
+            fsg_t0 = datetime.datetime.now()
+            try:
+                fsg_model = auto_lambda_model if is_fsg_auto else guidance_scale_model
+                fsg_lam = 0.0 if is_fsg_auto else task_info
+                fsg_img = generate_fsg(
+                    pipeline, fsg_model,
+                    prompt_text, fsg_lam, SEED, device,
+                    fsg_iterations=3,
+                    cached_embeds=prompt_embed_cache.get(prompt_text),
+                )
+                fsg_img.save(fsg_image_path)
+                fsg_meta = {
+                    "prompt_id": prompt_id, "prompt": prompt_text,
+                    "method": fsg_dir_name,
+                    "fsg_iterations": 3,
+                    "seed": SEED,
+                    "guidance_scale": GUIDANCE_SCALE,
+                    "num_inference_steps": NUM_INFERENCE_STEPS,
+                    "checkpoint": args.checkpoint,
+                    "timestamp": datetime.datetime.now().isoformat(),
+                }
+                with open(fsg_meta_path, 'w') as f:
+                    json.dump(fsg_meta, f, indent=2)
+                total_images += 1
+                image_counter += 1
+                fsg_sec = (datetime.datetime.now() - fsg_t0).total_seconds()
+                print(f"  prompt {prompt_id} {fsg_label} | {fsg_sec:.1f}s | {image_counter}/{total_expected}", flush=True)
+            except Exception as e:
+                print(f"  [R{rank}] ERROR prompt {prompt_id} {fsg_label}: {e}")
+                image_counter += 1
+
         else:  # baseline
             bl_dir_name, bl_label, bl_w, bl_cfgpp = task_info
             bl_dir = os.path.join(prompt_dir, bl_dir_name)
@@ -695,6 +770,12 @@ def main():
                     if os.path.exists(img_path):
                         images_for_grid.append(Image.open(img_path))
                         labels_for_grid.append("auto-λ")
+                # FSG variants
+                for fsg_dir, fsg_lbl in [("fsg_lambda_0.40", "FSG λ=0.4"), ("fsg_auto_lambda", "FSG auto-λ")]:
+                    img_path = os.path.join(prompt_dir, fsg_dir, f"seed_{SEED}.png")
+                    if os.path.exists(img_path):
+                        images_for_grid.append(Image.open(img_path))
+                        labels_for_grid.append(fsg_lbl)
                 if args.baselines:
                     for bl_dir_name, bl_label, _, _ in BASELINES:
                         img_path = os.path.join(prompt_dir, bl_dir_name, f"seed_{SEED}.png")
@@ -718,6 +799,8 @@ def main():
             if fig_prompts:
                 summary_lambdas = list(lambda_values) \
                     + ([("auto_lambda", "auto-λ")] if args.auto_lambda else []) \
+                    + [("fsg_lambda_0.40", "FSG λ=0.4")] \
+                    + ([("fsg_auto_lambda", "FSG auto-λ")] if args.auto_lambda else []) \
                     + ([(bl[0], bl[1]) for bl in BASELINES] if args.baselines else [])
                 summary_path = os.path.join(fig_dir, f"{fig_name}_summary.png")
                 create_figure_summary(fig_dir, fig_name, fig_prompts, summary_lambdas, summary_path)

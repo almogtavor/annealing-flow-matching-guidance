@@ -78,6 +78,9 @@ class MyStableDiffusion3Pipeline(StableDiffusion3Pipeline):
         guidance_scale_model: Optional[ScalarMLP] = None,
         guidance_lambda: Optional[float] = None,
         use_cfgpp: bool = False,
+        # --- FSG: Fixed-point Stochastic Guidance ---
+        use_fsg: bool = False,
+        fsg_iterations: int = 3,
     ):
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
@@ -256,14 +259,82 @@ class MyStableDiffusion3Pipeline(StableDiffusion3Pipeline):
                         noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                     if _use_cfgpp_step:
-                        # CFG++ denoising step (flow-matching equivalent):
-                        #   x0_pred  = z_t - sigma_t * v_guided       (guided signal estimate)
-                        #   eps_uncond = z_t + (1-sigma_t) * v_uncond  (unconditional noise)
-                        #   z_{t-1}  = (1-sigma_{t-1}) * x0_pred + sigma_{t-1} * eps_uncond
                         sigma_t = t.float() / 1000.0
                         sigma_t1 = timesteps[i + 1].float() / 1000.0 if (i + 1 < len(timesteps)) else 0.0
+                        orig_dtype = noise_pred_uncond.dtype
 
-                        latents_f32 = latents.float()
+                        if use_fsg and fsg_iterations > 0:
+                            # --- FSG: Fixed-point Stochastic Guidance ---
+                            # K inner iterations: guided forward → unconditional inverse
+                            # to refine z_t before the final step.
+                            z_t = latents.float()
+                            for _k in range(fsg_iterations):
+                                # (1) Compute v_u, v_c, delta at current z_t
+                                _fsg_input = torch.cat([z_t.to(orig_dtype)] * 2)
+                                _fsg_ts = t.expand(_fsg_input.shape[0])
+                                _fsg_pred = self.transformer(
+                                    hidden_states=_fsg_input,
+                                    timestep=_fsg_ts,
+                                    encoder_hidden_states=prompt_embeds,
+                                    pooled_projections=pooled_prompt_embeds,
+                                    joint_attention_kwargs=self.joint_attention_kwargs,
+                                    return_dict=False,
+                                )[0]
+                                _vu, _vt = _fsg_pred.chunk(2)
+
+                                # (2) Predict w and form guided velocity
+                                if use_annealing_guidance and guidance_scale_model is not None:
+                                    _w = guidance_scale_model(t, guidance_lambda, _vu.float(), _vt.float())
+                                    _v_guided = _vu.float() + _w * (_vt.float() - _vu.float())
+                                else:
+                                    _v_guided = _vu.float() + self._cfgpp_w * (_vt.float() - _vu.float())
+
+                                # (3) Guided forward step: z_t → z_s (using sigma_t1 as s)
+                                _x0 = z_t - sigma_t * _v_guided
+                                _eps_u = z_t + (1.0 - sigma_t) * _vu.float()
+                                z_s = (1.0 - sigma_t1) * _x0 + sigma_t1 * _eps_u
+
+                                # (4) Unconditional inverse step: z_s → z_t
+                                # Run transformer on z_s at t_{i+1} to get v_u only
+                                _fsg_inv_ts = timesteps[i + 1] if (i + 1 < len(timesteps)) else t
+                                _fsg_inv_ts = _fsg_inv_ts.expand(z_s.shape[0])
+                                _vu_s = self.transformer(
+                                    hidden_states=z_s.to(orig_dtype),
+                                    timestep=_fsg_inv_ts,
+                                    encoder_hidden_states=prompt_embeds[:prompt_embeds.shape[0]//2],
+                                    pooled_projections=pooled_prompt_embeds[:pooled_prompt_embeds.shape[0]//2],
+                                    joint_attention_kwargs=self.joint_attention_kwargs,
+                                    return_dict=False,
+                                )[0].float()
+
+                                # Inverse: z_t = z_s + (sigma_t - sigma_t1) * v_u(z_s)
+                                # Using flow-matching: z_t = (1-sigma_t)*x0_inv + sigma_t*eps_inv
+                                _x0_inv = z_s - sigma_t1 * _vu_s
+                                _eps_inv = z_s + (1.0 - sigma_t1) * _vu_s
+                                z_t = (1.0 - sigma_t) * _x0_inv + sigma_t * _eps_inv
+
+                            # Final: recompute guidance at refined z_t and do actual step
+                            _fsg_input = torch.cat([z_t.to(orig_dtype)] * 2)
+                            _fsg_ts = t.expand(_fsg_input.shape[0])
+                            _fsg_pred = self.transformer(
+                                hidden_states=_fsg_input,
+                                timestep=_fsg_ts,
+                                encoder_hidden_states=prompt_embeds,
+                                pooled_projections=pooled_prompt_embeds,
+                                joint_attention_kwargs=self.joint_attention_kwargs,
+                                return_dict=False,
+                            )[0]
+                            noise_pred_uncond, noise_pred_text = _fsg_pred.chunk(2)
+                            if use_annealing_guidance and guidance_scale_model is not None:
+                                _w = guidance_scale_model(t, guidance_lambda, noise_pred_uncond.float(), noise_pred_text.float())
+                                v_guided = noise_pred_uncond.float() + _w * (noise_pred_text.float() - noise_pred_uncond.float())
+                            else:
+                                v_guided = noise_pred_uncond.float() + self._cfgpp_w * (noise_pred_text.float() - noise_pred_uncond.float())
+                            latents_f32 = z_t
+                        else:
+                            latents_f32 = latents.float()
+
+                        # CFG++ denoising step (flow-matching equivalent)
                         x0_pred = latents_f32 - sigma_t * v_guided
                         eps_uncond = latents_f32 + (1.0 - sigma_t) * noise_pred_uncond.float()
                         latents = ((1.0 - sigma_t1) * x0_pred + sigma_t1 * eps_uncond).to(orig_dtype)
