@@ -3,7 +3,7 @@ tags: ["sanity check", "eps only"]
 
 diffusion:
   model_id: stabilityai/stable-diffusion-3-medium-diffusers
-  num_timesteps: 50
+  num_sampling_steps: 50
   vanilla_cfg: 1
   scheduler_kwargs:
     beta_start: 0.00085

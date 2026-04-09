@@ -10,6 +10,19 @@ import torch
 from src.utils.train_utils import add_noise_to_prompt, linear_schedule, get_timestep
 
 
+def get_num_sampling_steps(config_or_diffusion, default=None):
+    """Read num_sampling_steps from a config dict, with num_timesteps as backward-compat alias.
+
+    Accepts either a full config or just the 'diffusion' subsection.
+    """
+    if config_or_diffusion is None:
+        return default
+    diff = config_or_diffusion.get('diffusion', config_or_diffusion)
+    if diff is None:
+        return default
+    return diff.get('num_sampling_steps') or diff.get('num_timesteps') or default
+
+
 def load_models(config, device):
     """Load SD3 pipeline + guidance MLP for training."""
     from src.pipelines.my_pipeline_stable_diffusion3 import MyStableDiffusion3Pipeline
@@ -33,7 +46,7 @@ def load_models(config, device):
         pipeline.transformer.enable_gradient_checkpointing()
 
     mlp_kwargs = dict(config['guidance_scale_model'])
-    mlp_kwargs.setdefault('num_timesteps', config['diffusion'].get('num_timesteps'))
+    mlp_kwargs.setdefault('num_timesteps', get_num_sampling_steps(config))
     model = ScalarMLP(**mlp_kwargs)
     model.to(device, dtype=torch.float32)
     model.device, model.dtype = device, torch.float32
@@ -108,7 +121,7 @@ def run_auto_sample(config):
     os.makedirs(os.path.join(repo, "logs", "sampling"), exist_ok=True)
     print(f"\n{'='*60}\nSUBMITTING SAMPLING JOB: {ckpt_id}\n{'='*60}\n", flush=True)
     export_vars = f"ALL,SD3_SAMPLE_CHECKPOINT={latest},SD3_SAMPLE_CHECKPOINT_ID={ckpt_id}"
-    n_steps = config.get('diffusion', {}).get('num_timesteps', '')
+    n_steps = get_num_sampling_steps(config, default='')
     job_name = f"sample-{ckpt_id}" if not n_steps else f"sample-steps{n_steps}"
     result = subprocess.run(
         ["sbatch", "--job-name", job_name, "--export", export_vars, script],

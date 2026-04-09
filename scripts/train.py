@@ -221,7 +221,7 @@ def forward_pass_sd3(
 
     use_vanilla_cfg = bool(config['diffusion'].get('vanilla_cfg', 0))
     # Explicit flow-matching step (differentiable through w for both CFG variants).
-    n_steps = config['diffusion'].get('num_timesteps', 50)
+    n_steps = train_utils_sd3.get_num_sampling_steps(config, default=50)
     st = (timestep.float() / 1000.0).to(device=noisy_latents.device)
     st1 = (st - 1.0 / n_steps).clamp(min=1e-4)
     st_, st1_ = st.view(-1, 1, 1, 1), st1.view(-1, 1, 1, 1)
@@ -231,7 +231,7 @@ def forward_pass_sd3(
     z_next = (1.0 - st1_) * x0 + st1_ * eps_u
 
     # Pass 2: direct delta loss (full backprop through frozen transformer)
-    n_steps = config['diffusion'].get('num_timesteps', 50)
+    n_steps = train_utils_sd3.get_num_sampling_steps(config, default=50)
     st = (timestep.float() / 1000.0).to(device=noisy_latents.device)
     st1 = (st - 1.0 / n_steps).clamp(min=1e-4)
     t_next = (st1 * 1000.0).to(dtype=timestep.dtype, device=timestep.device)

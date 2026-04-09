@@ -71,7 +71,7 @@ def load_pipeline_and_model(checkpoint_path, device, dtype):
         delta_embed_dim=model_cfg.get('delta_embed_dim', 4),
         lambda_embed_dim=model_cfg.get('lambda_embed_dim', 4),
         t_embed_normalization=model_cfg.get('t_embed_normalization', 1e3),
-        num_timesteps=model_cfg.get('num_timesteps') or checkpoint.get('config', {}).get('diffusion', {}).get('num_timesteps'),
+        num_timesteps=model_cfg.get('num_timesteps') or checkpoint.get('config', {}).get('diffusion', {}).get('num_sampling_steps') or checkpoint.get('config', {}).get('diffusion', {}).get('num_timesteps'),
         delta_embed_normalization=model_cfg.get('delta_embed_normalization', 5.0),
         w_bias=model_cfg.get('w_bias', 1.0),
         w_scale=model_cfg.get('w_scale', 1.0),
@@ -80,7 +80,8 @@ def load_pipeline_and_model(checkpoint_path, device, dtype):
     guidance_scale_model.load_state_dict(state_dict, strict=True)
     guidance_scale_model.eval()
 
-    training_num_timesteps = checkpoint.get('config', {}).get('diffusion', {}).get('num_timesteps')
+    diff_cfg = checkpoint.get('config', {}).get('diffusion', {})
+    training_num_timesteps = diff_cfg.get('num_sampling_steps') or diff_cfg.get('num_timesteps')
     return pipeline, guidance_scale_model, training_num_timesteps
 
 

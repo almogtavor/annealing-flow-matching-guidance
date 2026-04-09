@@ -140,7 +140,7 @@ def forward_pass_fsg(config, pipeline, model, images, prompts):
     """
     B = images.size(0)
     dtype = pipeline.transformer.dtype
-    T = config['diffusion'].get('num_timesteps', 20)
+    T = train_utils_sd3.get_num_sampling_steps(config, default=20)
     fsg_cfg = config.get('fsg', {})
     sc_weight = fsg_cfg.get('sc_weight', FSG_SC_WEIGHT)
 

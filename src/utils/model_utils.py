@@ -46,7 +46,8 @@ def load_config(config_path=None, checkpoint_path=None):
     return state_dict, config
 
 def load_scheduler(config):
-    num_timesteps = config['diffusion']['num_timesteps']
+    diff = config['diffusion']
+    num_timesteps = diff.get('num_sampling_steps') or diff.get('num_timesteps')
     scheduler_type = config['diffusion'].get('scheduler_type', 'ddim')
     scheduler = MyDDIMScheduler(**config['diffusion']['scheduler_kwargs'])
     scheduler.set_timesteps(num_timesteps)
