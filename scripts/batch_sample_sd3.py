@@ -169,24 +169,39 @@ def create_figure_summary(fig_dir, fig_name, prompts, lambda_values, save_path):
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 30)
         font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
+        font_prompt = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 26)
     except Exception:
         font = ImageFont.load_default()
         font_small = font
+        font_prompt = font
+
+    import textwrap
+    def _wrap_prompt(text, width=14):
+        return textwrap.wrap(text, width=width)
 
     # Collect all images (rows=prompts, cols=lambdas)
     thumb_size = 256
     col_header_h = 60
-    row_label_w = 420
+    col_footer_h = 70  # 2 lines: avg sec/image + NFE
+    row_label_w = 260
     padding = 4
 
     n_rows = len(prompts)
     n_cols = len(lambda_values)
 
     grid_w = row_label_w + n_cols * (thumb_size + padding) + padding
-    grid_h = col_header_h + n_rows * (thumb_size + padding) + padding
+    grid_h = col_header_h + n_rows * (thumb_size + padding) + padding + col_footer_h
 
     grid = Image.new('RGB', (grid_w, grid_h), 'white')
     draw = ImageDraw.Draw(grid)
+    col_secs = [[] for _ in range(n_cols)]  # accumulate per-column sampling times
+    col_nfes = [None] * n_cols  # NFEs per column (constant per type, set on first read)
+
+    def _nfe_for(col_dir, num_steps):
+        """NFEs per image: FSG = (n-3)*2 + 33 (sites K=3,2,2). Regular = n*2."""
+        if col_dir.startswith('fsg_'):
+            return max(0, num_steps - 3) * 2 + 33
+        return num_steps * 2
 
     # Draw column headers (lambda values + baselines)
     for j, lam in enumerate(lambda_values):
@@ -209,27 +224,49 @@ def create_figure_summary(fig_dir, fig_name, prompts, lambda_values, save_path):
         prompt_dir_name = f"prompt_{prompt_id:03d}_{prompt_slug}"
         prompt_dir = os.path.join(fig_dir, prompt_dir_name)
 
-        # Row label (prompt text, wrapped)
-        short_text = prompt_text if len(prompt_text) <= 55 else prompt_text[:52] + "..."
+        # Row label: id + wrapped prompt (fits within row_label_w)
         draw.text((5, y + 5), f"#{prompt_id}", fill='black', font=font)
-        draw.text((5, y + 40), short_text, fill='gray', font=font_small)
+        wrapped_lines = _wrap_prompt(prompt_text, width=22)
+        for li, line in enumerate(wrapped_lines[:11]):  # cap lines so we don't overflow row
+            draw.text((5, y + 40 + li * 22), line, fill='#444', font=font_small)
 
         for j, lam in enumerate(lambda_values):
             x = row_label_w + j * (thumb_size + padding) + padding
             if isinstance(lam, tuple):
-                # Baseline: (dir_name, label)
-                img_path = os.path.join(prompt_dir, lam[0], f"seed_{SEED}.png")
+                col_dir = lam[0]
             else:
-                img_path = os.path.join(prompt_dir, f"lambda_{lam:.2f}", f"seed_{SEED}.png")
+                col_dir = f"lambda_{lam:.2f}"
+            img_path = os.path.join(prompt_dir, col_dir, f"seed_{SEED}.png")
+            meta_path = os.path.join(prompt_dir, col_dir, "meta.json")
 
             if os.path.exists(img_path):
                 img = Image.open(img_path)
                 img = img.resize((thumb_size, thumb_size), Image.LANCZOS)
                 grid.paste(img, (x, y))
+                # Try to read seconds and num_inference_steps from meta.json
+                if os.path.exists(meta_path):
+                    try:
+                        with open(meta_path) as _f:
+                            _m = json.load(_f)
+                        if 'seconds' in _m:
+                            col_secs[j].append(float(_m['seconds']))
+                        if col_nfes[j] is None and 'num_inference_steps' in _m:
+                            col_nfes[j] = _nfe_for(col_dir, int(_m['num_inference_steps']))
+                    except Exception:
+                        pass
             else:
-                # Draw placeholder
                 draw.rectangle([x, y, x + thumb_size, y + thumb_size], fill='lightgray', outline='gray')
                 draw.text((x + 20, y + thumb_size // 2), "missing", fill='gray', font=font_small)
+
+    # Footer rows: line 1 = avg sec/image, line 2 = NFE
+    footer_y = col_header_h + n_rows * (thumb_size + padding) + padding + 5
+    for j in range(n_cols):
+        x = row_label_w + j * (thumb_size + padding) + padding
+        if col_secs[j]:
+            avg = sum(col_secs[j]) / len(col_secs[j])
+            draw.text((x + 10, footer_y), f"{avg:.1f} sec/image", fill='black', font=font_small)
+        if col_nfes[j] is not None:
+            draw.text((x + 10, footer_y + 30), f"{col_nfes[j]} NFE", fill='black', font=font_small)
 
     _save_with_pdf(grid, save_path)
     print(f"  Figure summary saved: {save_path}")
@@ -580,6 +617,7 @@ def main():
                     prompt_text, lam, SEED, device,
                     cached_embeds=prompt_embed_cache.get(prompt_text),
                 )
+                img_sec = (datetime.datetime.now() - img_t0).total_seconds()
                 image.save(image_path)
                 meta = {
                     "prompt_id": prompt_id, "prompt": prompt_text,
@@ -587,13 +625,13 @@ def main():
                     "guidance_scale": GUIDANCE_SCALE,
                     "num_inference_steps": NUM_INFERENCE_STEPS,
                     "checkpoint": args.checkpoint,
+                    "seconds": img_sec,
                     "timestamp": datetime.datetime.now().isoformat(),
                 }
                 with open(meta_path, 'w') as f:
                     json.dump(meta, f, indent=2)
                 total_images += 1
                 image_counter += 1
-                img_sec = (datetime.datetime.now() - img_t0).total_seconds()
                 print(f"  prompt {prompt_id} λ={lam:.2f} | {img_sec:.1f}s | {image_counter}/{total_expected}", flush=True)
             except Exception as e:
                 print(f"  [R{rank}] ERROR prompt {prompt_id} λ={lam:.2f}: {e}")
@@ -617,6 +655,7 @@ def main():
                     prompt_text, 0.0, SEED, device,
                     cached_embeds=prompt_embed_cache.get(prompt_text),
                 )
+                al_sec = (datetime.datetime.now() - al_t0).total_seconds()
                 al_img.save(al_image_path)
                 al_meta = {
                     "prompt_id": prompt_id, "prompt": prompt_text,
@@ -626,13 +665,13 @@ def main():
                     "guidance_scale": GUIDANCE_SCALE,
                     "num_inference_steps": NUM_INFERENCE_STEPS,
                     "checkpoint": args.checkpoint,
+                    "seconds": al_sec,
                     "timestamp": datetime.datetime.now().isoformat(),
                 }
                 with open(al_meta_path, 'w') as f:
                     json.dump(al_meta, f, indent=2)
                 total_images += 1
                 image_counter += 1
-                al_sec = (datetime.datetime.now() - al_t0).total_seconds()
                 print(f"  prompt {prompt_id} auto_lambda | {al_sec:.1f}s | {image_counter}/{total_expected}", flush=True)
             except Exception as e:
                 print(f"  [R{rank}] ERROR prompt {prompt_id} auto_lambda: {e}")
@@ -662,6 +701,7 @@ def main():
                     fsg_iterations=3,
                     cached_embeds=prompt_embed_cache.get(prompt_text),
                 )
+                fsg_sec = (datetime.datetime.now() - fsg_t0).total_seconds()
                 fsg_img.save(fsg_image_path)
                 fsg_meta = {
                     "prompt_id": prompt_id, "prompt": prompt_text,
@@ -671,13 +711,13 @@ def main():
                     "guidance_scale": GUIDANCE_SCALE,
                     "num_inference_steps": NUM_INFERENCE_STEPS,
                     "checkpoint": args.checkpoint,
+                    "seconds": fsg_sec,
                     "timestamp": datetime.datetime.now().isoformat(),
                 }
                 with open(fsg_meta_path, 'w') as f:
                     json.dump(fsg_meta, f, indent=2)
                 total_images += 1
                 image_counter += 1
-                fsg_sec = (datetime.datetime.now() - fsg_t0).total_seconds()
                 print(f"  prompt {prompt_id} {fsg_label} | {fsg_sec:.1f}s | {image_counter}/{total_expected}", flush=True)
             except Exception as e:
                 print(f"  [R{rank}] ERROR prompt {prompt_id} {fsg_label}: {e}")
@@ -702,19 +742,20 @@ def main():
                     guidance_scale=bl_w, use_cfgpp=bl_cfgpp,
                     cached_embeds=prompt_embed_cache.get(prompt_text),
                 )
+                bl_sec = (datetime.datetime.now() - bl_t0).total_seconds()
                 bl_img.save(bl_image_path)
                 bl_meta = {
                     "prompt_id": prompt_id, "prompt": prompt_text,
                     "type": bl_dir_name, "label": bl_label, "seed": SEED,
                     "guidance_scale": bl_w, "use_cfgpp": bl_cfgpp,
                     "num_inference_steps": NUM_INFERENCE_STEPS,
+                    "seconds": bl_sec,
                     "timestamp": datetime.datetime.now().isoformat(),
                 }
                 with open(bl_meta_path, 'w') as f:
                     json.dump(bl_meta, f, indent=2)
                 total_images += 1
                 image_counter += 1
-                bl_sec = (datetime.datetime.now() - bl_t0).total_seconds()
                 print(f"  prompt {prompt_id} {bl_label} | {bl_sec:.1f}s | {image_counter}/{total_expected}", flush=True)
             except Exception as e:
                 print(f"  [R{rank}] ERROR prompt {prompt_id} {bl_label}: {e}")

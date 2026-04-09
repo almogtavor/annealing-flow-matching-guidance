@@ -34,7 +34,7 @@ if _REPO_ROOT not in sys.path:
 # ---------------------------------------------------------------------------
 # Constants matching the paper
 # ---------------------------------------------------------------------------
-NUM_IMAGES = 3000
+NUM_IMAGES = 1000
 NUM_INFERENCE_STEPS = 28
 SEED_OFFSET = 0  # seed = image_id (from COCO)
 

@@ -215,6 +215,17 @@ class MyStableDiffusion3Pipeline(StableDiffusion3Pipeline):
             else:
                 self._joint_attention_kwargs.update(ip_adapter_image_embeds=ip_adapter_image_embeds)
 
+        # Pre-compute FSG site → inference-step mapping (each FSG site fires
+        # once at the inference step closest to its target timestep).
+        _fsg_site_iters = {}  # step_idx -> K
+        if use_fsg and fsg_iterations > 0:
+            from src.utils.fsg_utils import get_fsg_sites
+            _sites = get_fsg_sites(num_inference_steps)
+            _ts_list = [float(_t) for _t in timesteps]
+            for _site in _sites:
+                _i_best = min(range(len(_ts_list)), key=lambda _i: abs(_ts_list[_i] - _site['t']))
+                _fsg_site_iters[_i_best] = _site['K']
+
         # 7. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -266,14 +277,15 @@ class MyStableDiffusion3Pipeline(StableDiffusion3Pipeline):
                         sigma_t1 = timesteps[i + 1].float() / 1000.0 if (i + 1 < len(timesteps)) else 0.0
                         orig_dtype = noise_pred_uncond.dtype
 
-                        if use_fsg and fsg_iterations > 0:
+                        if use_fsg and i in _fsg_site_iters:
                             # --- FSG: Fixed-point Stochastic Guidance ---
-                            # K inner iterations: guided forward → unconditional inverse
-                            # to refine z_t before the final step.
+                            # Run K inner iterations only at the 3 designated sites
+                            # (rest of the trajectory uses plain CFG++).
                             from src.utils import fsg_stats as _fsg_stats
+                            _site_K = _fsg_site_iters[i]
                             z_t = latents.float()
                             _z_t_prev = z_t.clone()
-                            for _k in range(fsg_iterations):
+                            for _k in range(_site_K):
                                 # (1) Compute v_u, v_c, delta at current z_t
                                 _fsg_input = torch.cat([z_t.to(orig_dtype)] * 2)
                                 _fsg_ts = t.expand(_fsg_input.shape[0])
