@@ -232,29 +232,41 @@ class MyStableDiffusion3Pipeline(StableDiffusion3Pipeline):
                 if self.interrupt:
                     continue
 
+                # At FSG sites the base transformer call is wasted: the FSG inner
+                # loop recomputes everything from latents, then the final post-FSG
+                # recompute provides the noise_pred used by the CFG++ step.
+                _is_fsg_site = bool(use_fsg and i in _fsg_site_iters)
+
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt_embeds,
-                    joint_attention_kwargs=self.joint_attention_kwargs,
-                    return_dict=False,
-                )[0]
+                if not _is_fsg_site:
+                    noise_pred = self.transformer(
+                        hidden_states=latent_model_input,
+                        timestep=timestep,
+                        encoder_hidden_states=prompt_embeds,
+                        pooled_projections=pooled_prompt_embeds,
+                        joint_attention_kwargs=self.joint_attention_kwargs,
+                        return_dict=False,
+                    )[0]
 
                 # perform guidance
                 _use_cfgpp_step = False
                 if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    if not _is_fsg_site:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
 
                     # --- BEGIN MODIFIED: Annealing guidance / CFG++ / CFG ---
                     _next_t = timesteps[i + 1] if (i + 1 < len(timesteps)) else torch.tensor(0.0, device=t.device)
 
-                    if use_annealing_guidance and guidance_scale_model is not None:
+                    if _is_fsg_site:
+                        # Skip the base v_guided computation; FSG block will set both
+                        # noise_pred_uncond and v_guided from the refined z_t.
+                        orig_dtype = latents.dtype
+                        _use_cfgpp_step = True
+                    elif use_annealing_guidance and guidance_scale_model is not None:
                         # Learned annealing guidance (CFG++ sampling)
                         orig_dtype = noise_pred_uncond.dtype
                         guidance_scale_pred = guidance_scale_model(

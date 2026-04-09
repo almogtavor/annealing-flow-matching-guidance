@@ -198,9 +198,13 @@ def create_figure_summary(fig_dir, fig_name, prompts, lambda_values, save_path):
     col_nfes = [None] * n_cols  # NFEs per column (constant per type, set on first read)
 
     def _nfe_for(col_dir, num_steps):
-        """NFEs per image: FSG = (n-3)*2 + 33 (sites K=3,2,2). Regular = n*2."""
+        """NFEs per image. Regular: n*2.
+        FSG: 3 sites with K=(3,2,2); each site costs (3K + 2) NFEs (no wasted base call).
+        Site 0 (K=3): 11; sites 1,2 (K=2): 8 each → 27 total.
+        Plus (n-3) regular CFG++ steps × 2 NFEs.
+        """
         if col_dir.startswith('fsg_'):
-            return max(0, num_steps - 3) * 2 + 33
+            return max(0, num_steps - 3) * 2 + 27
         return num_steps * 2
 
     # Draw column headers (lambda values + baselines)
