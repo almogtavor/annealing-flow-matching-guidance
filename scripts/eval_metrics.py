@@ -19,6 +19,7 @@ import json
 import csv
 import argparse
 import hashlib
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -120,16 +121,50 @@ def apg_guidance(noise_pred_uncond, noise_pred_text, guidance_scale):
 def load_pipeline(device, dtype):
     from src.pipelines.my_pipeline_stable_diffusion3 import MyStableDiffusion3Pipeline
     hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
-    pipeline = MyStableDiffusion3Pipeline.from_pretrained(
-        "stabilityai/stable-diffusion-3-medium-diffusers",
-        torch_dtype=dtype,
-        token=hf_token,
-    )
-    pipeline.to(device)
+    eval_cache = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "prompt_cache", "_eval_prompts.pt")
+    if os.path.exists(eval_cache):
+        print(f"Eval prompt cache found; loading without text encoders.", flush=True)
+        pipeline = MyStableDiffusion3Pipeline.from_pretrained(
+            "stabilityai/stable-diffusion-3-medium-diffusers",
+            torch_dtype=dtype, token=hf_token,
+            text_encoder=None, text_encoder_2=None, text_encoder_3=None,
+        )
+        pipeline.transformer.to(device)
+        pipeline.vae.to(device)
+    else:
+        pipeline = MyStableDiffusion3Pipeline.from_pretrained(
+            "stabilityai/stable-diffusion-3-medium-diffusers",
+            torch_dtype=dtype, token=hf_token,
+        )
+        pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
     if hasattr(pipeline, "enable_attention_slicing"):
         pipeline.enable_attention_slicing()
     return pipeline
+
+
+def _align_eval_conditioning(
+    pipeline,
+    device,
+    prompt_embeds,
+    negative_prompt_embeds,
+    pooled_prompt_embeds,
+    negative_pooled_prompt_embeds,
+):
+    from src.pipelines.my_pipeline_stable_diffusion3 import _align_transformer_conditioning
+
+    _, prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = (
+        _align_transformer_conditioning(
+            pipeline.transformer,
+            torch.device(device),
+            prompt_embeds,
+            negative_prompt_embeds,
+            pooled_prompt_embeds,
+            negative_pooled_prompt_embeds,
+        )
+    )
+    return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
 
 
 class AutoLambdaWrapper(torch.nn.Module):
@@ -183,7 +218,7 @@ def load_guidance_model(checkpoint_path, device):
 def generate_single(pipeline, prompt, seed, device, guidance_scale,
                     use_cfgpp=False, use_apg=False,
                     guidance_scale_model=None, guidance_lambda=None,
-                    use_fsg=False, fsg_iterations=3):
+                    use_fsg=False, fsg_iterations=3, cached_embeds=None):
     """Generate a single image. Supports CFG, CFG++, APG, Annealing, and FSG."""
     generator = torch.Generator(device="cuda:0").manual_seed(seed)
 
@@ -191,16 +226,24 @@ def generate_single(pipeline, prompt, seed, device, guidance_scale,
 
     if use_apg:
         with torch.inference_mode():
-            return _generate_apg(pipeline, prompt, seed, device, guidance_scale, generator)
+            return _generate_apg(pipeline, prompt, seed, device, guidance_scale, generator,
+                                 cached_embeds=cached_embeds)
 
     kwargs = dict(
         guidance_scale=guidance_scale,
         num_inference_steps=NUM_INFERENCE_STEPS,
         generator=generator,
-        prompt=prompt,
         use_annealing_guidance=use_annealing,
         use_cfgpp=use_cfgpp,
     )
+    if cached_embeds is not None:
+        pe, npe, ppe, nppe = _align_eval_conditioning(pipeline, device, *cached_embeds)
+        kwargs["prompt_embeds"] = pe
+        kwargs["negative_prompt_embeds"] = npe
+        kwargs["pooled_prompt_embeds"] = ppe
+        kwargs["negative_pooled_prompt_embeds"] = nppe
+    else:
+        kwargs["prompt"] = prompt
     if use_annealing:
         kwargs["guidance_scale_model"] = guidance_scale_model
         kwargs["guidance_lambda"] = guidance_lambda
@@ -212,33 +255,30 @@ def generate_single(pipeline, prompt, seed, device, guidance_scale,
         return pipeline(**kwargs).images[0]
 
 
-def _generate_apg(pipeline, prompt, seed, device, guidance_scale, generator):
+def _generate_apg(pipeline, prompt, seed, device, guidance_scale, generator, cached_embeds=None):
     """Generate with APG by temporarily patching the pipeline's guidance step."""
-    # We use standard pipeline but override the guidance combination.
-    # The trick: set guidance_scale=1.0 (disable built-in CFG) and manually
-    # combine in a callback. But SD3 pipeline doesn't support per-step callbacks
-    # for guidance easily. Instead, we'll do a simpler approach:
-    #
-    # Run the pipeline with do_classifier_free_guidance=True but intercept
-    # the noise_pred combination. We achieve this by temporarily monkey-patching
-    # the transformer's forward to capture uncond/cond, then apply APG.
-
-    # Simpler approach: use the pipeline normally but with a hook that replaces
-    # the guidance combination.
-    # SIMPLEST: run the denoising loop manually, matching the pipeline's logic.
-    # This is what the paper likely did too.
-
-    # Encode prompt
-    (
-        prompt_embeds,
-        negative_prompt_embeds,
-        pooled_prompt_embeds,
-        negative_pooled_prompt_embeds,
-    ) = pipeline.encode_prompt(
-        prompt=prompt,
-        prompt_2=None,
-        prompt_3=None,
-        do_classifier_free_guidance=True,
+    if cached_embeds is not None:
+        prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = \
+            cached_embeds
+    else:
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+            pooled_prompt_embeds,
+            negative_pooled_prompt_embeds,
+        ) = pipeline.encode_prompt(
+            prompt=prompt, prompt_2=None, prompt_3=None,
+            do_classifier_free_guidance=True,
+        )
+    prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = (
+        _align_eval_conditioning(
+            pipeline,
+            device,
+            prompt_embeds,
+            negative_prompt_embeds,
+            pooled_prompt_embeds,
+            negative_pooled_prompt_embeds,
+        )
     )
 
     # Prepare timesteps
@@ -292,7 +332,7 @@ def generate_images_for_config(pipeline, prompts, save_dir, device,
                                guidance_scale, use_cfgpp=False, use_apg=False,
                                guidance_scale_model=None, guidance_lambda=None,
                                use_fsg=False, fsg_iterations=3,
-                               rank=0, world_size=1):
+                               rank=0, world_size=1, prompt_embed_cache=None):
     """Generate images for all prompts, saving to save_dir/. Skip existing."""
     os.makedirs(save_dir, exist_ok=True)
 
@@ -309,6 +349,7 @@ def generate_images_for_config(pipeline, prompts, save_dir, device,
             guidance_scale, use_cfgpp=use_cfgpp, use_apg=use_apg,
             guidance_scale_model=guidance_scale_model, guidance_lambda=guidance_lambda,
             use_fsg=use_fsg, fsg_iterations=fsg_iterations,
+            cached_embeds=prompt_embed_cache.get(caption) if prompt_embed_cache else None,
         )
         img.save(img_path)
         del img
@@ -337,6 +378,51 @@ def compute_fid(gen_dir, ref_dir):
             print("WARNING: Neither clean-fid nor pytorch-fid installed. "
                   "Install with: pip install clean-fid")
             return float('nan')
+
+
+# Cache Inception features per folder so the reference set is extracted once.
+_FEATURE_CACHE = {}
+
+
+def _get_inception_features(folder, device="cuda"):
+    """Extract clean-fid Inception-V3 (2048-d) features for every image in `folder`.
+
+    Cached per folder path. Returns a numpy array of shape (N, 2048)."""
+    if folder in _FEATURE_CACHE:
+        return _FEATURE_CACHE[folder]
+    try:
+        from cleanfid import fid as cleanfid
+        from cleanfid.features import build_feature_extractor
+    except ImportError:
+        print("WARNING: clean-fid not installed; cannot compute precision/recall.")
+        return None
+    model = build_feature_extractor("clean", device=device)
+    feats = cleanfid.get_folder_features(
+        folder, model=model, num_workers=4, batch_size=64,
+        device=device, mode="clean", description=os.path.basename(folder),
+        verbose=False,
+    )
+    _FEATURE_CACHE[folder] = feats
+    return feats
+
+
+def compute_precision_recall(gen_dir, ref_dir, nearest_k=5, device="cuda"):
+    """Kynkäänniemi et al. precision/recall using clean-fid Inception features.
+
+    Returns (precision, recall) as floats in [0, 1]. NaN on failure."""
+    try:
+        from prdc import compute_prdc
+    except ImportError:
+        print("WARNING: prdc not installed. Install with: pip install prdc")
+        return float('nan'), float('nan')
+    real_feats = _get_inception_features(ref_dir, device=device)
+    fake_feats = _get_inception_features(gen_dir, device=device)
+    if real_feats is None or fake_feats is None:
+        return float('nan'), float('nan')
+    metrics = compute_prdc(real_features=real_feats,
+                           fake_features=fake_feats,
+                           nearest_k=nearest_k)
+    return float(metrics["precision"]), float(metrics["recall"])
 
 
 def compute_clip_score(gen_dir, prompts):
@@ -438,8 +524,14 @@ def main():
     parser.add_argument("--annealing_lambdas", type=float, nargs="+",
                         default=ANNEALING_LAMBDAS,
                         help="Lambda values to evaluate")
+    parser.add_argument("--include_fsg", action="store_true",
+                        help="Force FSG inference variants even if MLP is not FSG-extended")
+    parser.add_argument("--fsg_lambdas", type=float, nargs="+", default=None,
+                        help="Lambda values for FSG variants (defaults to --annealing_lambdas)")
     parser.add_argument("--num_steps", type=int, default=None,
                         help="Number of inference steps (must match training num_timesteps)")
+    parser.add_argument("--fp32", action="store_true", default=False,
+                        help="Run the transformer/VAE in float32 instead of float16")
     args = parser.parse_args()
 
     global NUM_INFERENCE_STEPS
@@ -449,7 +541,7 @@ def main():
     rank, world_size, local_rank = get_rank_info()
     torch.cuda.set_device(local_rank)
     device = f"cuda:{local_rank}"
-    dtype = torch.float16
+    dtype = torch.float32 if args.fp32 else torch.float16
 
     if rank != 0:
         import builtins
@@ -460,6 +552,14 @@ def main():
     # --- Load COCO prompts ---
     prompts = get_coco_prompts(args.coco_dir)
     print(f"Loaded {len(prompts)} COCO prompts")
+
+    if args.checkpoint and args.num_steps is None:
+        checkpoint_meta = torch.load(args.checkpoint, map_location="cpu")
+        diff_cfg = checkpoint_meta.get("config", {}).get("diffusion", {})
+        inferred_steps = diff_cfg.get("num_sampling_steps") or diff_cfg.get("num_timesteps")
+        if inferred_steps is not None:
+            NUM_INFERENCE_STEPS = inferred_steps
+            print(f"Auto-inferred num_inference_steps={NUM_INFERENCE_STEPS} from checkpoint")
 
     coco_val_dir = os.path.join(args.coco_dir, "val2017")
     os.makedirs(args.output_dir, exist_ok=True)
@@ -479,6 +579,13 @@ def main():
         # --- Load pipeline ---
         pipeline = load_pipeline(device, dtype)
 
+        # --- Load eval prompt cache if available ---
+        eval_cache_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                       "prompt_cache", "_eval_prompts.pt")
+        eval_prompt_cache = torch.load(eval_cache_path, map_location="cpu") if os.path.exists(eval_cache_path) else None
+        if eval_prompt_cache:
+            print(f"Loaded {len(eval_prompt_cache)} cached eval prompts.", flush=True)
+
         # --- Generate baselines (cached) ---
         if not args.skip_baselines:
             print("\n=== Generating baselines (cached) ===")
@@ -494,6 +601,7 @@ def main():
                     pipeline, prompts, save_dir, device,
                     guidance_scale=w, use_cfgpp=use_cfgpp, use_apg=use_apg,
                     rank=rank, world_size=world_size,
+                    prompt_embed_cache=eval_prompt_cache,
                 )
 
         # --- Generate annealing images ---
@@ -511,9 +619,12 @@ def main():
             for lam in args.annealing_lambdas:
                 variants.append((f"annealing_lambda{lam:.2f}", guidance_model, lam, False))
             variants.append(("annealing_auto_lambda", auto_model, 0.0, False))
-            if is_extended:
-                print("  Detected extended MLP — adding FSG inference variants")
-                for lam in args.annealing_lambdas:
+            fsg_lambdas = args.fsg_lambdas if args.fsg_lambdas is not None else args.annealing_lambdas
+            include_fsg = is_extended or args.include_fsg
+            if include_fsg:
+                reason = "extended MLP" if is_extended else "forced via --include_fsg"
+                print(f"  Adding FSG inference variants ({reason}); lambdas={fsg_lambdas}")
+                for lam in fsg_lambdas:
                     variants.append((f"annealing_fsg_lambda{lam:.2f}", guidance_model, lam, True))
                 variants.append(("annealing_fsg_auto_lambda", auto_model, 0.0, True))
 
@@ -532,11 +643,18 @@ def main():
                     guidance_scale_model=model_to_use, guidance_lambda=lam,
                     use_fsg=use_fsg,
                     rank=rank, world_size=world_size,
+                    prompt_embed_cache=eval_prompt_cache,
                 )
 
-        # Synchronize GPUs before metrics
+        # Synchronize GPUs before metrics. Use a long timeout: on a resume,
+        # existing images are unevenly distributed across ranks, so fast ranks
+        # may need to wait hours for slow ranks to finish generating (esp.
+        # FSG or fp32 runs).
         if world_size > 1:
-            torch.distributed.init_process_group(backend="nccl")
+            torch.distributed.init_process_group(
+                backend="nccl",
+                timeout=timedelta(hours=12),
+            )
             torch.distributed.barrier()
 
         # Free pipeline memory before metrics
@@ -558,6 +676,7 @@ def main():
             fid = compute_fid(gen_dir, coco_val_dir)
             clip_score = compute_clip_score(gen_dir, prompts)
             img_reward = compute_image_reward(gen_dir, prompts)
+            precision, recall = compute_precision_recall(gen_dir, coco_val_dir)
             results.append({
                 "method": method,
                 "config": dir_name,
@@ -566,8 +685,10 @@ def main():
                 "FID": f"{fid:.2f}",
                 "CLIP": f"{clip_score:.4f}",
                 "ImageReward": f"{img_reward:.4f}",
+                "Precision": f"{precision:.4f}",
+                "Recall": f"{recall:.4f}",
             })
-            print(f"    FID={fid:.2f}  CLIP={clip_score:.4f}  ImageReward={img_reward:.4f}")
+            print(f"    FID={fid:.2f}  CLIP={clip_score:.4f}  ImageReward={img_reward:.4f}  P={precision:.4f}  R={recall:.4f}")
 
         # Annealing (regular + auto, plus FSG variants if extended MLP)
         if args.checkpoint:
@@ -585,8 +706,9 @@ def main():
             mcfg = ckpt.get('model_config') or ckpt.get('config', {}).get('guidance_scale_model', {})
             is_extended = mcfg.get('interval_embed_dim', 0) > 0 or mcfg.get('c_embed_dim', 0) > 0
             del ckpt
-            if is_extended:
-                for lam in args.annealing_lambdas:
+            fsg_lambdas = args.fsg_lambdas if args.fsg_lambdas is not None else args.annealing_lambdas
+            if is_extended or args.include_fsg:
+                for lam in fsg_lambdas:
                     anneal_variants.append((f"annealing_fsg_lambda{lam:.2f}",
                                             f"Annealing FSG ({label})", lam))
                 anneal_variants.append(("annealing_fsg_auto_lambda",
@@ -601,6 +723,7 @@ def main():
                 fid = compute_fid(gen_dir, coco_val_dir)
                 clip_score = compute_clip_score(gen_dir, prompts)
                 img_reward = compute_image_reward(gen_dir, prompts)
+                precision, recall = compute_precision_recall(gen_dir, coco_val_dir)
                 results.append({
                     "method": method_label,
                     "config": dir_name,
@@ -609,8 +732,10 @@ def main():
                     "FID": f"{fid:.2f}",
                     "CLIP": f"{clip_score:.4f}",
                     "ImageReward": f"{img_reward:.4f}",
+                    "Precision": f"{precision:.4f}",
+                    "Recall": f"{recall:.4f}",
                 })
-                print(f"    FID={fid:.2f}  CLIP={clip_score:.4f}  ImageReward={img_reward:.4f}")
+                print(f"    FID={fid:.2f}  CLIP={clip_score:.4f}  ImageReward={img_reward:.4f}  P={precision:.4f}  R={recall:.4f}")
 
         # --- Save CSV ---
         csv_path = os.path.join(args.output_dir, "metrics_table.csv")
@@ -623,18 +748,31 @@ def main():
             print(f"\n=== Results saved to {csv_path} ===")
 
             # Also print as formatted table
-            print("\n" + "=" * 80)
-            print(f"{'Method':<20} {'Config':<20} {'w':>5} {'λ':>5} {'FID':>8} {'CLIP':>8} {'ImgRew':>10}")
-            print("-" * 80)
+            print("\n" + "=" * 100)
+            print(f"{'Method':<20} {'Config':<20} {'w':>5} {'λ':>5} {'FID':>8} {'CLIP':>8} {'ImgRew':>10} {'P':>8} {'R':>8}")
+            print("-" * 100)
             for r in results:
                 print(f"{r['method']:<20} {r['config']:<20} {r['guidance_scale']:>5} "
-                      f"{str(r['lambda']):>5} {r['FID']:>8} {r['CLIP']:>8} {r['ImageReward']:>10}")
-            print("=" * 80)
+                      f"{str(r['lambda']):>5} {r['FID']:>8} {r['CLIP']:>8} {r['ImageReward']:>10} "
+                      f"{r.get('Precision', ''):>8} {r.get('Recall', ''):>8}")
+            print("=" * 100)
 
         # Save as JSON too
         json_path = os.path.join(args.output_dir, "metrics_table.json")
         with open(json_path, "w") as f:
             json.dump(results, f, indent=2)
+
+        # Append to cumulative results file
+        global_csv = os.path.join(os.path.dirname(args.output_dir), "results.csv")
+        write_header = not os.path.exists(global_csv)
+        ckpt_name = os.path.basename(args.checkpoint) if args.checkpoint else ""
+        with open(global_csv, "a", newline="") as f:
+            fields = ["run", "checkpoint"] + list(results[0].keys())
+            writer = csv.DictWriter(f, fieldnames=fields)
+            if write_header:
+                writer.writeheader()
+            for r in results:
+                writer.writerow({"run": os.path.basename(args.output_dir), "checkpoint": ckpt_name, **r})
 
 
 if __name__ == "__main__":

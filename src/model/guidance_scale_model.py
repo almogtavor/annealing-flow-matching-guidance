@@ -25,8 +25,10 @@ class ScalarMLP(nn.Module):
         c_input_dim: int = 2048,      # SD3 pooled prompt embed dim (CLIP-L 768 + CLIP-G 1280)
         # Normalizations applied before embedding
         t_embed_normalization: float = 1e3,  # SD3 timesteps are [0, 1000], so t/1000 → [0, 1]
-        delta_embed_normalization: float = 5.0,
-        # Number of denoising steps (T); timestep input is normalized as t/T
+        delta_embed_normalization=5.0,  # float, or "ema_p95" to track EMA of p95(delta_norm)
+        delta_ema_decay: float = 0.99,
+        delta_ema_init: float = 5.0,
+        # Number of denoising steps (T)
         num_timesteps: int = None,
         # Final affine on head output
         w_bias: float = 1.0,
@@ -44,8 +46,10 @@ class ScalarMLP(nn.Module):
         layers += [nn.Linear(hidden_size, output_size)]
         self.combined_head = nn.Sequential(*layers)
 
-        # Prompt projection (only when c_embed_dim > 0)
-        self.c_proj = nn.Linear(c_input_dim, c_embed_dim) if c_embed_dim > 0 else None
+        # Prompt projection: 2-layer MLP with SiLU (matches Learn to Guide MS-COCO setup)
+        self.c_proj = nn.Sequential(
+            nn.Linear(c_input_dim, 256), nn.SiLU(), nn.Linear(256, c_embed_dim)
+        ) if c_embed_dim > 0 else None
 
         # Config
         self.t_embed_dim = t_embed_dim
@@ -56,7 +60,15 @@ class ScalarMLP(nn.Module):
 
         # Always normalize timesteps to [0, 1] via t/1000 (SD3 timesteps are in [0, 1000])
         self.t_embed_normalization = t_embed_normalization
-        self.delta_embed_normalization = delta_embed_normalization
+
+        self.use_ema_p95_delta = isinstance(delta_embed_normalization, str) and delta_embed_normalization == "ema_p95"
+        if self.use_ema_p95_delta:
+            self.delta_embed_normalization = None
+            self.delta_ema_decay = float(delta_ema_decay)
+            self.register_buffer("delta_norm_ema_p95", torch.tensor(float(delta_ema_init)))
+            self.register_buffer("delta_ema_initialized", torch.tensor(0, dtype=torch.long))
+        else:
+            self.delta_embed_normalization = float(delta_embed_normalization)
 
         self.w_bias = w_bias
         self.w_scale = w_scale
@@ -97,7 +109,7 @@ class ScalarMLP(nn.Module):
             l:        scalar or (B,)
             noise_pred_uncond: (B, C, H, W)
             noise_pred_text:   (B, C, H, W)
-            interval: (t-s)/T normalized interval length, scalar or (B,).
+            interval: (t-s)/1000 normalized interval length, scalar or (B,).
                       Only used when interval_embed_dim > 0; ignored otherwise.
             c_emb:    (B, c_input_dim) pooled prompt embeddings.
                       Only used when c_embed_dim > 0; ignored otherwise.
@@ -117,7 +129,20 @@ class ScalarMLP(nn.Module):
 
         # 3) Build features with embeddings
         t_feat = self._embed_value(timestep / self.t_embed_normalization, self.t_embed_dim)           # (B, t_embed_dim)
-        d_feat = self._embed_value(delta_norm / self.delta_embed_normalization, self.delta_embed_dim) # (B, delta_embed_dim)
+        if self.use_ema_p95_delta:
+            if self.training:
+                with torch.no_grad():
+                    p95 = torch.quantile(delta_norm.detach().float(), 0.95)
+                    if int(self.delta_ema_initialized.item()) == 0:
+                        self.delta_norm_ema_p95.copy_(p95.to(self.delta_norm_ema_p95))
+                        self.delta_ema_initialized.fill_(1)
+                    else:
+                        d = self.delta_ema_decay
+                        self.delta_norm_ema_p95.mul_(d).add_(p95.to(self.delta_norm_ema_p95) * (1.0 - d))
+            delta_divisor = self.delta_norm_ema_p95.clamp(min=1e-6).to(dtype=delta_norm.dtype)
+        else:
+            delta_divisor = self.delta_embed_normalization
+        d_feat = self._embed_value(delta_norm / delta_divisor, self.delta_embed_dim) # (B, delta_embed_dim)
         l_feat = self._embed_value(l, self.lambda_embed_dim)        # (B, lambda_embed_dim)
 
         parts = [t_feat, d_feat, l_feat]

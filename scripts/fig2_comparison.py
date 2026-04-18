@@ -84,14 +84,14 @@ class AutoLambdaWrapper(nn.Module):
     """Wraps ScalarMLP to use geometry-based lambda_t, capturing both w and lambda_t.
 
     x        = clip((1 + cos(v_u, delta_t)) / 2, 0, 1)
-    lambda_t = 0.5 + sign(x - 0.5) * sqrt(|2x - 1|) / 2
-
-    Symmetric sqrt spread around 0.5: preserves 0, 0.5, 1 exactly.
+    lambda_t = x                                               if simple=True
+               0.5 + sign(x - 0.5) * sqrt(|2x - 1|) / 2        otherwise (sqrt warp)
     """
 
-    def __init__(self, mlp):
+    def __init__(self, mlp, simple: bool = False):
         super().__init__()
         self.mlp = mlp
+        self.simple = simple
         self.lambda_trajectory = []  # filled during generation
 
     def forward(self, timestep, l, noise_pred_uncond, noise_pred_text, **mlp_extras):
@@ -100,7 +100,10 @@ class AutoLambdaWrapper(nn.Module):
         B = v_u.shape[0]
         cos_sim = F.cosine_similarity(v_u.reshape(B, -1), delta_t.reshape(B, -1), dim=1)
         x = torch.clamp((1.0 + cos_sim) / 2.0, 0.0, 1.0)
-        lambda_t = 0.5 + torch.sign(x - 0.5) * torch.sqrt(torch.abs(2.0 * x - 1.0)) / 2.0
+        if self.simple:
+            lambda_t = x
+        else:
+            lambda_t = 0.5 + torch.sign(x - 0.5) * torch.sqrt(torch.abs(2.0 * x - 1.0)) / 2.0
 
         self.lambda_trajectory.append(lambda_t.detach().float().mean().item())
         return self.mlp(timestep, lambda_t, noise_pred_uncond, noise_pred_text, **mlp_extras)
@@ -203,7 +206,9 @@ def generate_annealing_fsg(pipeline, guidance_scale_model, prompt, lambda_val, s
 
 def plot_guidance_trajectories(traj_a, traj_b, save_path,
                                auto_traj_a=None, auto_traj_b=None,
-                               auto_lambda_vals_a=None, auto_lambda_vals_b=None):
+                               auto_lambda_vals_a=None, auto_lambda_vals_b=None,
+                               auto_traj_a_simple=None, auto_traj_b_simple=None,
+                               auto_lambda_vals_a_simple=None, auto_lambda_vals_b_simple=None):
     """Plot guidance scale vs timestep for both prompts, matching Fig 2 style."""
     import matplotlib
     matplotlib.use('Agg')
@@ -225,6 +230,7 @@ def plot_guidance_trajectories(traj_a, traj_b, save_path,
     ax.plot(ts_a, ws_a, color='#8b008b', linewidth=2.5, label='Annealing λ=0.4 (A)')
     ax.plot(ts_b, ws_b, color='#0000cd', linewidth=2.5, label='Annealing λ=0.4 (B)')
 
+    has_auto_simple = auto_traj_a_simple is not None
     if has_auto:
         ts_aa = [d["timestep"] for d in auto_traj_a]
         ws_aa = [d["guidance_scale"] for d in auto_traj_a]
@@ -232,6 +238,13 @@ def plot_guidance_trajectories(traj_a, traj_b, save_path,
         ws_ab = [d["guidance_scale"] for d in auto_traj_b]
         ax.plot(ts_aa, ws_aa, color='#ff6600', linewidth=2.5, linestyle='--', label='Auto-λ (A)')
         ax.plot(ts_ab, ws_ab, color='#cc0000', linewidth=2.5, linestyle='--', label='Auto-λ (B)')
+    if has_auto_simple:
+        ts_aas = [d["timestep"] for d in auto_traj_a_simple]
+        ws_aas = [d["guidance_scale"] for d in auto_traj_a_simple]
+        ts_abs = [d["timestep"] for d in auto_traj_b_simple]
+        ws_abs = [d["guidance_scale"] for d in auto_traj_b_simple]
+        ax.plot(ts_aas, ws_aas, color='#ff6600', linewidth=2.5, linestyle=':', label='Auto-λ simple (A)')
+        ax.plot(ts_abs, ws_abs, color='#cc0000', linewidth=2.5, linestyle=':', label='Auto-λ simple (B)')
 
     ax.set_xlabel('Timestep', fontsize=14)
     ax.set_ylabel('Guidance Scale', fontsize=14)
@@ -244,6 +257,11 @@ def plot_guidance_trajectories(traj_a, traj_b, save_path,
         ax2 = axes[1, 0]
         ax2.plot(ts_aa, auto_lambda_vals_a, color='#ff6600', linewidth=2.5, label='λ_geo (A)')
         ax2.plot(ts_ab, auto_lambda_vals_b, color='#cc0000', linewidth=2.5, label='λ_geo (B)')
+        if has_auto_simple:
+            ax2.plot(ts_aas, auto_lambda_vals_a_simple, color='#ff6600',
+                     linewidth=2.5, linestyle=':', label='λ_simple (A)')
+            ax2.plot(ts_abs, auto_lambda_vals_b_simple, color='#cc0000',
+                     linewidth=2.5, linestyle=':', label='λ_simple (B)')
         ax2.set_xlabel('Timestep', fontsize=14)
         ax2.set_ylabel('Auto-λ value', fontsize=14)
         ax2.legend(fontsize=10, loc='upper left')
@@ -260,7 +278,9 @@ def plot_guidance_trajectories(traj_a, traj_b, save_path,
 
 def create_comparison_figure(images_dict, traj_a, traj_b, save_path,
                              auto_traj_a=None, auto_traj_b=None,
-                             auto_lambda_vals_a=None, auto_lambda_vals_b=None):
+                             auto_lambda_vals_a=None, auto_lambda_vals_b=None,
+                             auto_traj_a_simple=None, auto_traj_b_simple=None,
+                             auto_lambda_vals_a_simple=None, auto_lambda_vals_b_simple=None):
     """Create the combined Fig 2: plots on top, image rows below."""
     import matplotlib
     matplotlib.use('Agg')
@@ -269,15 +289,21 @@ def create_comparison_figure(images_dict, traj_a, traj_b, save_path,
 
     present_methods = set(m for (_, m) in images_dict.keys())
     has_auto = "Auto-λ (Ours)" in present_methods
+    has_auto_simple = "Auto-λ simple (Ours)" in present_methods
     has_fsg = "Annealing FSG λ=0.4 (Ours)" in present_methods
     has_fsg_auto = "Annealing FSG Auto-λ (Ours)" in present_methods
+    has_fsg_auto_simple = "Annealing FSG Auto-λ simple (Ours)" in present_methods
     methods = ["CFG", "CFG++", "Annealing λ=0.4"]
     if has_auto:
         methods.append("Auto-λ (Ours)")
+    if has_auto_simple:
+        methods.append("Auto-λ simple (Ours)")
     if has_fsg:
         methods.append("Annealing FSG λ=0.4 (Ours)")
     if has_fsg_auto:
         methods.append("Annealing FSG Auto-λ (Ours)")
+    if has_fsg_auto_simple:
+        methods.append("Annealing FSG Auto-λ simple (Ours)")
     ncols = len(methods)
     nplot_rows = 2 if has_auto else 1
 
@@ -305,6 +331,13 @@ def create_comparison_figure(images_dict, traj_a, traj_b, save_path,
         ws_ab = [d["guidance_scale"] for d in auto_traj_b]
         ax_plot.plot(ts_aa, ws_aa, color='#ff6600', linewidth=2.5, linestyle='--', label='Auto-λ (A)')
         ax_plot.plot(ts_ab, ws_ab, color='#cc0000', linewidth=2.5, linestyle='--', label='Auto-λ (B)')
+    if auto_traj_a_simple:
+        ts_aas = [d["timestep"] for d in auto_traj_a_simple]
+        ws_aas = [d["guidance_scale"] for d in auto_traj_a_simple]
+        ts_abs = [d["timestep"] for d in auto_traj_b_simple]
+        ws_abs = [d["guidance_scale"] for d in auto_traj_b_simple]
+        ax_plot.plot(ts_aas, ws_aas, color='#ff6600', linewidth=2.5, linestyle=':', label='Auto-λ simple (A)')
+        ax_plot.plot(ts_abs, ws_abs, color='#cc0000', linewidth=2.5, linestyle=':', label='Auto-λ simple (B)')
 
     ax_plot.set_xlabel('Timestep', fontsize=14)
     ax_plot.set_ylabel('Guidance Scale', fontsize=14)
@@ -317,6 +350,11 @@ def create_comparison_figure(images_dict, traj_a, traj_b, save_path,
         ax_lam = fig.add_subplot(gs[1, :])
         ax_lam.plot(ts_aa, auto_lambda_vals_a, color='#ff6600', linewidth=2.5, label='λ_geo (A)')
         ax_lam.plot(ts_ab, auto_lambda_vals_b, color='#cc0000', linewidth=2.5, label='λ_geo (B)')
+        if auto_lambda_vals_a_simple:
+            ax_lam.plot(ts_aas, auto_lambda_vals_a_simple, color='#ff6600',
+                        linewidth=2.5, linestyle=':', label='λ_simple (A)')
+            ax_lam.plot(ts_abs, auto_lambda_vals_b_simple, color='#cc0000',
+                        linewidth=2.5, linestyle=':', label='λ_simple (B)')
         ax_lam.set_xlabel('Timestep', fontsize=14)
         ax_lam.set_ylabel('Auto-λ value', fontsize=14)
         ax_lam.legend(fontsize=10, loc='upper left')
@@ -355,6 +393,10 @@ def main():
                         help='Generate auto-lambda images and plot lambda_geo trajectory (default: on)')
     parser.add_argument('--no_auto_lambda', action='store_false', dest='auto_lambda',
                         help='Disable auto-lambda generation')
+    parser.add_argument('--auto_lambda_simple', action='store_true', default=True,
+                        help='Also generate auto-lambda simple (x without sqrt warp) variants (default: on)')
+    parser.add_argument('--no_auto_lambda_simple', action='store_false', dest='auto_lambda_simple',
+                        help='Disable auto-lambda simple generation')
     parser.add_argument('--num_steps', type=int, default=None,
                         help='Number of inference steps (must match training num_timesteps)')
     args = parser.parse_args()
@@ -386,12 +428,17 @@ def main():
         NUM_INFERENCE_STEPS = training_steps
         print(f"  Auto-inferred num_inference_steps={NUM_INFERENCE_STEPS} from checkpoint")
 
-    # Build auto-lambda wrapper if requested
+    # Build auto-lambda wrapper(s) if requested
     auto_lambda_model = None
+    auto_lambda_simple_model = None
     if args.auto_lambda:
-        auto_lambda_model = AutoLambdaWrapper(guidance_scale_model)
+        auto_lambda_model = AutoLambdaWrapper(guidance_scale_model, simple=False)
         auto_lambda_model.eval()
-        print("  Auto-lambda enabled for fig2")
+        print("  Auto-lambda (sqrt warp) enabled for fig2")
+    if args.auto_lambda_simple:
+        auto_lambda_simple_model = AutoLambdaWrapper(guidance_scale_model, simple=True)
+        auto_lambda_simple_model.eval()
+        print("  Auto-lambda simple (x = clip((1+cos)/2)) enabled for fig2")
 
     # Pre-encode prompts
     print("Pre-encoding prompts...")
@@ -413,6 +460,8 @@ def main():
     trajectories = {}  # label -> trajectory list
     auto_trajectories = {}  # label -> trajectory list (w values)
     auto_lambda_values = {}  # label -> list of lambda_geo values
+    auto_trajectories_simple = {}  # label -> trajectory list (w values, simple)
+    auto_lambda_values_simple = {}  # label -> list of lambda_geo values (simple)
 
     for label, prompt in PROMPTS:
         print(f"\n--- Prompt {label}: {prompt} ---")
@@ -462,6 +511,21 @@ def main():
             print(f"    Done in {sec:.1f}s | {len(auto_traj)} timesteps, "
                   f"λ_geo range [{min(auto_lambda_values[label]):.3f}, {max(auto_lambda_values[label]):.3f}]")
 
+        # 4b) Auto-lambda simple (if requested)
+        if auto_lambda_simple_model is not None:
+            print(f"  Generating Auto-λ simple...")
+            auto_lambda_simple_model.reset_trajectory()
+            t0 = datetime.datetime.now()
+            img_auto_s, auto_traj_s = generate_annealing(
+                pipeline, auto_lambda_simple_model, prompt, 0.0, SEED, device, cached)
+            sec = (datetime.datetime.now() - t0).total_seconds()
+            img_auto_s.save(os.path.join(output_dir, f"prompt_{label}_auto_lambda_simple.png"))
+            images[(label, "Auto-λ simple (Ours)")] = img_auto_s
+            auto_trajectories_simple[label] = auto_traj_s
+            auto_lambda_values_simple[label] = list(auto_lambda_simple_model.lambda_trajectory)
+            print(f"    Done in {sec:.1f}s | {len(auto_traj_s)} timesteps, "
+                  f"λ_simple range [{min(auto_lambda_values_simple[label]):.3f}, {max(auto_lambda_values_simple[label]):.3f}]")
+
         # 5) Annealing with FSG (λ=0.4)
         print(f"  Generating Annealing FSG (λ={ANNEALING_LAMBDA})...")
         t0 = datetime.datetime.now()
@@ -484,11 +548,26 @@ def main():
             images[(label, "Annealing FSG Auto-λ (Ours)")] = img_fsg_auto
             print(f"    Done in {sec:.1f}s")
 
+        # 6b) Annealing FSG with auto-lambda simple
+        if auto_lambda_simple_model is not None:
+            print(f"  Generating Annealing FSG Auto-λ simple...")
+            auto_lambda_simple_model.reset_trajectory()
+            t0 = datetime.datetime.now()
+            img_fsg_auto_s, _ = generate_annealing_fsg(
+                pipeline, auto_lambda_simple_model, prompt, 0.0, SEED, device, cached)
+            sec = (datetime.datetime.now() - t0).total_seconds()
+            img_fsg_auto_s.save(os.path.join(output_dir, f"prompt_{label}_annealing_fsg_auto_simple.png"))
+            images[(label, "Annealing FSG Auto-λ simple (Ours)")] = img_fsg_auto_s
+            print(f"    Done in {sec:.1f}s")
+
     # Save trajectories as JSON
     traj_data = {"annealing": trajectories}
     if auto_trajectories:
         traj_data["auto_lambda_w"] = {k: v for k, v in auto_trajectories.items()}
         traj_data["auto_lambda_geo"] = {k: v for k, v in auto_lambda_values.items()}
+    if auto_trajectories_simple:
+        traj_data["auto_lambda_simple_w"] = {k: v for k, v in auto_trajectories_simple.items()}
+        traj_data["auto_lambda_simple_geo"] = {k: v for k, v in auto_lambda_values_simple.items()}
     traj_path = os.path.join(output_dir, "guidance_trajectories.json")
     with open(traj_path, 'w') as f:
         json.dump(traj_data, f, indent=2)
@@ -501,7 +580,11 @@ def main():
         auto_traj_a=auto_trajectories.get("A"),
         auto_traj_b=auto_trajectories.get("B"),
         auto_lambda_vals_a=auto_lambda_values.get("A"),
-        auto_lambda_vals_b=auto_lambda_values.get("B"))
+        auto_lambda_vals_b=auto_lambda_values.get("B"),
+        auto_traj_a_simple=auto_trajectories_simple.get("A"),
+        auto_traj_b_simple=auto_trajectories_simple.get("B"),
+        auto_lambda_vals_a_simple=auto_lambda_values_simple.get("A"),
+        auto_lambda_vals_b_simple=auto_lambda_values_simple.get("B"))
 
     # Create combined figure
     create_comparison_figure(
@@ -510,15 +593,23 @@ def main():
         auto_traj_a=auto_trajectories.get("A"),
         auto_traj_b=auto_trajectories.get("B"),
         auto_lambda_vals_a=auto_lambda_values.get("A"),
-        auto_lambda_vals_b=auto_lambda_values.get("B"))
+        auto_lambda_vals_b=auto_lambda_values.get("B"),
+        auto_traj_a_simple=auto_trajectories_simple.get("A"),
+        auto_traj_b_simple=auto_trajectories_simple.get("B"),
+        auto_lambda_vals_a_simple=auto_lambda_values_simple.get("A"),
+        auto_lambda_vals_b_simple=auto_lambda_values_simple.get("B"))
 
     # Individual image grid per prompt
     grid_methods = ["CFG", "CFG++", "Annealing λ=0.4"]
     if auto_lambda_model is not None:
         grid_methods.append("Auto-λ (Ours)")
+    if auto_lambda_simple_model is not None:
+        grid_methods.append("Auto-λ simple (Ours)")
     grid_methods.append("Annealing FSG λ=0.4 (Ours)")
     if auto_lambda_model is not None:
         grid_methods.append("Annealing FSG Auto-λ (Ours)")
+    if auto_lambda_simple_model is not None:
+        grid_methods.append("Annealing FSG Auto-λ simple (Ours)")
     for label, prompt in PROMPTS:
         row_images = [images[(label, m)] for m in grid_methods]
         row_labels = list(grid_methods)

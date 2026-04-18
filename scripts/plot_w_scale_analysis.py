@@ -72,6 +72,11 @@ def main():
 
     model, cfg, step = load_model(ckpt_path)
     dn_norm = cfg.get("delta_embed_normalization", 5.0)
+    if isinstance(dn_norm, str):
+        if hasattr(model, "delta_norm_ema_p95"):
+            dn_norm = float(model.delta_norm_ema_p95.detach().cpu().item())
+        else:
+            dn_norm = 5.0
 
     timesteps = np.linspace(0, 1000, 200)
     lambda_vals = [0.0, 0.05, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]

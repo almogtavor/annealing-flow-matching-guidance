@@ -11,7 +11,11 @@ def maybe_resume(config, model, optimizer=None):
     Set  training.resume_from: path/to/checkpoint_step_XXXX.pt  in the YAML
     to resume. If the key is absent or null, training starts from scratch.
 
-    Returns the step to resume from (0 if no resume).
+    Returns the step to resume from (0 if no resume). When the checkpoint
+    records `global_samples_seen` and the new run uses a different
+    global_batch_size (e.g. different GPU count), the returned step is
+    recomputed as samples_seen // new_global_batch_size so training continues
+    at the correct data position instead of early-exiting.
     """
     ckpt_path = config.get('training', {}).get('resume_from')
     if not ckpt_path:
@@ -33,6 +37,15 @@ def maybe_resume(config, model, optimizer=None):
     step = ckpt.get('step', 0)
     samples_seen = ckpt.get('global_samples_seen')
     if samples_seen is not None:
+        new_global_batch = config['training'].get('batch_size', 1) * int(os.environ.get('WORLD_SIZE', 1))
+        rescaled_step = samples_seen // max(new_global_batch, 1)
+        if rescaled_step != step:
+            print(
+                f"  Rescaling resume step {step} -> {rescaled_step} "
+                f"(samples_seen={samples_seen}, new_global_batch={new_global_batch}).",
+                flush=True,
+            )
+        step = rescaled_step
         print(f"  Resuming from step {step} ({samples_seen} global images).", flush=True)
     else:
         print(f"  Resuming from step {step}.", flush=True)
