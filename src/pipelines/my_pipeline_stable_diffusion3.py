@@ -110,6 +110,7 @@ class MyStableDiffusion3Pipeline(StableDiffusion3Pipeline):
         guidance_scale_model: Optional[ScalarMLP] = None,
         guidance_lambda: Optional[float] = None,
         use_cfgpp: bool = False,
+        use_cfgpp_step: bool = True,
         # --- FSG: Fixed-point Stochastic Guidance ---
         use_fsg: bool = False,
         fsg_iterations: int = 3,
@@ -443,15 +444,21 @@ class MyStableDiffusion3Pipeline(StableDiffusion3Pipeline):
                         else:
                             latents_f32 = latents.float()
 
-                        # CFG++ denoising step (flow-matching equivalent)
-                        x0_pred = latents_f32 - sigma_t * v_guided
-                        eps_uncond = latents_f32 + (1.0 - sigma_t) * noise_pred_uncond.float()
-                        latents = ((1.0 - sigma_t1) * x0_pred + sigma_t1 * eps_uncond).to(orig_dtype)
+                        if use_cfgpp_step:
+                            # CFG++ denoising step (flow-matching equivalent)
+                            x0_pred = latents_f32 - sigma_t * v_guided
+                            eps_uncond = latents_f32 + (1.0 - sigma_t) * noise_pred_uncond.float()
+                            latents = ((1.0 - sigma_t1) * x0_pred + sigma_t1 * eps_uncond).to(orig_dtype)
 
-                        # Advance scheduler step index (we bypassed scheduler.step)
-                        if self.scheduler.step_index is None:
-                            self.scheduler._init_step_index(t)
-                        self.scheduler._step_index += 1
+                            # Advance scheduler step index (we bypassed scheduler.step)
+                            if self.scheduler.step_index is None:
+                                self.scheduler._init_step_index(t)
+                            self.scheduler._step_index += 1
+                        else:
+                            # Vanilla CFG step: use guided velocity as noise_pred and run scheduler.step below
+                            latents = latents_f32.to(orig_dtype)
+                            noise_pred = v_guided.to(orig_dtype)
+                            _use_cfgpp_step = False
                     # --- END MODIFIED ---
 
                     should_skip_layers = (

@@ -217,12 +217,17 @@ if [[ -n "$CKPT" && -n "$CKPT_ID" ]]; then
     "$PY" -m pip install -q clean-fid open_clip_torch image-reward 2>/dev/null || true
 
     echo "Running FID/CLIP/ImageReward evaluation..."
+    EVAL_EXTRA_ARGS=""
+    if [[ "${SD3_SAMPLE_FP32:-}" == "1" ]]; then
+        EVAL_EXTRA_ARGS="$EVAL_EXTRA_ARGS --fp32"
+    fi
     $TORCHRUN --nproc_per_node="$NGPUS" --standalone \
         scripts/eval_metrics.py \
         --checkpoint "$CKPT" \
         --output_dir "$OUTPUT_ROOT/$CKPT_ID" \
         --coco_dir "$COCO_DIR" \
-        --label "$CKPT_ID"
+        --label "$CKPT_ID" \
+        $EVAL_EXTRA_ARGS
 else
     "$PY" -u scripts/sample_sd3.py
 fi

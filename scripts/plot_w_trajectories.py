@@ -41,6 +41,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--results_dir", required=True)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--title", default=None, help="Override figure suptitle.")
     args = parser.parse_args()
 
     data = load_w_histories(args.results_dir)
@@ -126,7 +127,7 @@ def main():
     ax_large.set_title(f"Large delta (prompt {large_pid})", fontsize=11)
     plot_methods(ax_large, filter_pid=large_pid)
 
-    fig.suptitle(f"Observed w trajectories — {os.path.basename(args.results_dir)}", fontsize=13)
+    fig.suptitle(args.title or f"Observed w trajectories — {os.path.basename(args.results_dir)}", fontsize=13)
     fig.tight_layout()
 
     out = args.output or os.path.join(args.results_dir, "w_trajectories.png")

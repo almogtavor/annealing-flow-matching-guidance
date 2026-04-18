@@ -19,6 +19,7 @@ import json
 import csv
 import argparse
 import hashlib
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -379,6 +380,51 @@ def compute_fid(gen_dir, ref_dir):
             return float('nan')
 
 
+# Cache Inception features per folder so the reference set is extracted once.
+_FEATURE_CACHE = {}
+
+
+def _get_inception_features(folder, device="cuda"):
+    """Extract clean-fid Inception-V3 (2048-d) features for every image in `folder`.
+
+    Cached per folder path. Returns a numpy array of shape (N, 2048)."""
+    if folder in _FEATURE_CACHE:
+        return _FEATURE_CACHE[folder]
+    try:
+        from cleanfid import fid as cleanfid
+        from cleanfid.features import build_feature_extractor
+    except ImportError:
+        print("WARNING: clean-fid not installed; cannot compute precision/recall.")
+        return None
+    model = build_feature_extractor("clean", device=device)
+    feats = cleanfid.get_folder_features(
+        folder, model=model, num_workers=4, batch_size=64,
+        device=device, mode="clean", description=os.path.basename(folder),
+        verbose=False,
+    )
+    _FEATURE_CACHE[folder] = feats
+    return feats
+
+
+def compute_precision_recall(gen_dir, ref_dir, nearest_k=5, device="cuda"):
+    """Kynkäänniemi et al. precision/recall using clean-fid Inception features.
+
+    Returns (precision, recall) as floats in [0, 1]. NaN on failure."""
+    try:
+        from prdc import compute_prdc
+    except ImportError:
+        print("WARNING: prdc not installed. Install with: pip install prdc")
+        return float('nan'), float('nan')
+    real_feats = _get_inception_features(ref_dir, device=device)
+    fake_feats = _get_inception_features(gen_dir, device=device)
+    if real_feats is None or fake_feats is None:
+        return float('nan'), float('nan')
+    metrics = compute_prdc(real_features=real_feats,
+                           fake_features=fake_feats,
+                           nearest_k=nearest_k)
+    return float(metrics["precision"]), float(metrics["recall"])
+
+
 def compute_clip_score(gen_dir, prompts):
     """Compute mean CLIP similarity between generated images and their prompts."""
     try:
@@ -478,8 +524,14 @@ def main():
     parser.add_argument("--annealing_lambdas", type=float, nargs="+",
                         default=ANNEALING_LAMBDAS,
                         help="Lambda values to evaluate")
+    parser.add_argument("--include_fsg", action="store_true",
+                        help="Force FSG inference variants even if MLP is not FSG-extended")
+    parser.add_argument("--fsg_lambdas", type=float, nargs="+", default=None,
+                        help="Lambda values for FSG variants (defaults to --annealing_lambdas)")
     parser.add_argument("--num_steps", type=int, default=None,
                         help="Number of inference steps (must match training num_timesteps)")
+    parser.add_argument("--fp32", action="store_true", default=False,
+                        help="Run the transformer/VAE in float32 instead of float16")
     args = parser.parse_args()
 
     global NUM_INFERENCE_STEPS
@@ -489,7 +541,7 @@ def main():
     rank, world_size, local_rank = get_rank_info()
     torch.cuda.set_device(local_rank)
     device = f"cuda:{local_rank}"
-    dtype = torch.float16
+    dtype = torch.float32 if args.fp32 else torch.float16
 
     if rank != 0:
         import builtins
@@ -567,9 +619,12 @@ def main():
             for lam in args.annealing_lambdas:
                 variants.append((f"annealing_lambda{lam:.2f}", guidance_model, lam, False))
             variants.append(("annealing_auto_lambda", auto_model, 0.0, False))
-            if is_extended:
-                print("  Detected extended MLP — adding FSG inference variants")
-                for lam in args.annealing_lambdas:
+            fsg_lambdas = args.fsg_lambdas if args.fsg_lambdas is not None else args.annealing_lambdas
+            include_fsg = is_extended or args.include_fsg
+            if include_fsg:
+                reason = "extended MLP" if is_extended else "forced via --include_fsg"
+                print(f"  Adding FSG inference variants ({reason}); lambdas={fsg_lambdas}")
+                for lam in fsg_lambdas:
                     variants.append((f"annealing_fsg_lambda{lam:.2f}", guidance_model, lam, True))
                 variants.append(("annealing_fsg_auto_lambda", auto_model, 0.0, True))
 
@@ -591,9 +646,15 @@ def main():
                     prompt_embed_cache=eval_prompt_cache,
                 )
 
-        # Synchronize GPUs before metrics
+        # Synchronize GPUs before metrics. Use a long timeout: on a resume,
+        # existing images are unevenly distributed across ranks, so fast ranks
+        # may need to wait hours for slow ranks to finish generating (esp.
+        # FSG or fp32 runs).
         if world_size > 1:
-            torch.distributed.init_process_group(backend="nccl")
+            torch.distributed.init_process_group(
+                backend="nccl",
+                timeout=timedelta(hours=12),
+            )
             torch.distributed.barrier()
 
         # Free pipeline memory before metrics
@@ -615,6 +676,7 @@ def main():
             fid = compute_fid(gen_dir, coco_val_dir)
             clip_score = compute_clip_score(gen_dir, prompts)
             img_reward = compute_image_reward(gen_dir, prompts)
+            precision, recall = compute_precision_recall(gen_dir, coco_val_dir)
             results.append({
                 "method": method,
                 "config": dir_name,
@@ -623,8 +685,10 @@ def main():
                 "FID": f"{fid:.2f}",
                 "CLIP": f"{clip_score:.4f}",
                 "ImageReward": f"{img_reward:.4f}",
+                "Precision": f"{precision:.4f}",
+                "Recall": f"{recall:.4f}",
             })
-            print(f"    FID={fid:.2f}  CLIP={clip_score:.4f}  ImageReward={img_reward:.4f}")
+            print(f"    FID={fid:.2f}  CLIP={clip_score:.4f}  ImageReward={img_reward:.4f}  P={precision:.4f}  R={recall:.4f}")
 
         # Annealing (regular + auto, plus FSG variants if extended MLP)
         if args.checkpoint:
@@ -642,8 +706,9 @@ def main():
             mcfg = ckpt.get('model_config') or ckpt.get('config', {}).get('guidance_scale_model', {})
             is_extended = mcfg.get('interval_embed_dim', 0) > 0 or mcfg.get('c_embed_dim', 0) > 0
             del ckpt
-            if is_extended:
-                for lam in args.annealing_lambdas:
+            fsg_lambdas = args.fsg_lambdas if args.fsg_lambdas is not None else args.annealing_lambdas
+            if is_extended or args.include_fsg:
+                for lam in fsg_lambdas:
                     anneal_variants.append((f"annealing_fsg_lambda{lam:.2f}",
                                             f"Annealing FSG ({label})", lam))
                 anneal_variants.append(("annealing_fsg_auto_lambda",
@@ -658,6 +723,7 @@ def main():
                 fid = compute_fid(gen_dir, coco_val_dir)
                 clip_score = compute_clip_score(gen_dir, prompts)
                 img_reward = compute_image_reward(gen_dir, prompts)
+                precision, recall = compute_precision_recall(gen_dir, coco_val_dir)
                 results.append({
                     "method": method_label,
                     "config": dir_name,
@@ -666,8 +732,10 @@ def main():
                     "FID": f"{fid:.2f}",
                     "CLIP": f"{clip_score:.4f}",
                     "ImageReward": f"{img_reward:.4f}",
+                    "Precision": f"{precision:.4f}",
+                    "Recall": f"{recall:.4f}",
                 })
-                print(f"    FID={fid:.2f}  CLIP={clip_score:.4f}  ImageReward={img_reward:.4f}")
+                print(f"    FID={fid:.2f}  CLIP={clip_score:.4f}  ImageReward={img_reward:.4f}  P={precision:.4f}  R={recall:.4f}")
 
         # --- Save CSV ---
         csv_path = os.path.join(args.output_dir, "metrics_table.csv")
@@ -680,13 +748,14 @@ def main():
             print(f"\n=== Results saved to {csv_path} ===")
 
             # Also print as formatted table
-            print("\n" + "=" * 80)
-            print(f"{'Method':<20} {'Config':<20} {'w':>5} {'λ':>5} {'FID':>8} {'CLIP':>8} {'ImgRew':>10}")
-            print("-" * 80)
+            print("\n" + "=" * 100)
+            print(f"{'Method':<20} {'Config':<20} {'w':>5} {'λ':>5} {'FID':>8} {'CLIP':>8} {'ImgRew':>10} {'P':>8} {'R':>8}")
+            print("-" * 100)
             for r in results:
                 print(f"{r['method']:<20} {r['config']:<20} {r['guidance_scale']:>5} "
-                      f"{str(r['lambda']):>5} {r['FID']:>8} {r['CLIP']:>8} {r['ImageReward']:>10}")
-            print("=" * 80)
+                      f"{str(r['lambda']):>5} {r['FID']:>8} {r['CLIP']:>8} {r['ImageReward']:>10} "
+                      f"{r.get('Precision', ''):>8} {r.get('Recall', ''):>8}")
+            print("=" * 100)
 
         # Save as JSON too
         json_path = os.path.join(args.output_dir, "metrics_table.json")

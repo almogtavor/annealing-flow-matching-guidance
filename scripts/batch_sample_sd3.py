@@ -380,7 +380,7 @@ def load_pipeline_and_model(checkpoint_path, device, dtype, auto_lambda=False):
 
 
 def generate_image(pipeline, guidance_scale_model, prompt, lambda_val, seed, device,
-                    cached_embeds=None):
+                    cached_embeds=None, use_cfgpp_step=True):
     """Generate a single image."""
     generator = torch.Generator(device="cuda:0").manual_seed(seed)
 
@@ -391,6 +391,7 @@ def generate_image(pipeline, guidance_scale_model, prompt, lambda_val, seed, dev
         use_annealing_guidance=True,
         guidance_scale_model=guidance_scale_model,
         guidance_lambda=lambda_val,
+        use_cfgpp_step=use_cfgpp_step,
     )
     if cached_embeds:
         kwargs.update(prompt_embeds=cached_embeds[0].to(device),
@@ -406,7 +407,7 @@ def generate_image(pipeline, guidance_scale_model, prompt, lambda_val, seed, dev
 
 
 def generate_fsg(pipeline, guidance_scale_model, prompt, lambda_val, seed, device,
-                 fsg_iterations=3, cached_embeds=None):
+                 fsg_iterations=3, cached_embeds=None, use_cfgpp_step=True):
     """Generate a single image using FSG (Fixed-point Stochastic Guidance)."""
     generator = torch.Generator(device="cuda:0").manual_seed(seed)
 
@@ -419,6 +420,7 @@ def generate_fsg(pipeline, guidance_scale_model, prompt, lambda_val, seed, devic
         guidance_lambda=lambda_val,
         use_fsg=True,
         fsg_iterations=fsg_iterations,
+        use_cfgpp_step=use_cfgpp_step,
     )
     if cached_embeds:
         kwargs.update(prompt_embeds=cached_embeds[0].to(device),
@@ -490,6 +492,10 @@ def main():
                         help='Disable auto-lambda generation')
     parser.add_argument('--num_steps', type=int, default=None,
                         help='Number of inference steps (must match training num_timesteps)')
+    parser.add_argument('--no_cfgpp_step', action='store_true', default=False,
+                        help='Use vanilla CFG step for MLP/FSG paths instead of CFG++ Euler step')
+    parser.add_argument('--fp32', action='store_true', default=False,
+                        help='Run the transformer/VAE in float32 instead of float16')
     args = parser.parse_args()
 
     # Override global NUM_INFERENCE_STEPS if provided
@@ -504,7 +510,7 @@ def main():
     rank, world_size, local_rank = _get_rank_info()
     torch.cuda.set_device(local_rank)
     device = f'cuda:{local_rank}'
-    dtype = torch.float16
+    dtype = torch.float32 if args.fp32 else torch.float16
 
     # Suppress prints on non-main ranks
     if rank != 0:
@@ -637,6 +643,7 @@ def main():
                     pipeline, guidance_scale_model,
                     prompt_text, lam, SEED, device,
                     cached_embeds=prompt_embed_cache.get(prompt_text),
+                    use_cfgpp_step=not args.no_cfgpp_step,
                 )
                 img_sec = (datetime.datetime.now() - img_t0).total_seconds()
                 image.save(image_path)
@@ -678,6 +685,7 @@ def main():
                     pipeline, auto_lambda_model,
                     prompt_text, 0.0, SEED, device,
                     cached_embeds=prompt_embed_cache.get(prompt_text),
+                    use_cfgpp_step=not args.no_cfgpp_step,
                 )
                 al_sec = (datetime.datetime.now() - al_t0).total_seconds()
                 al_img.save(al_image_path)
@@ -727,6 +735,7 @@ def main():
                     prompt_text, fsg_lam, SEED, device,
                     fsg_iterations=3,
                     cached_embeds=prompt_embed_cache.get(prompt_text),
+                    use_cfgpp_step=not args.no_cfgpp_step,
                 )
                 fsg_sec = (datetime.datetime.now() - fsg_t0).total_seconds()
                 fsg_img.save(fsg_image_path)

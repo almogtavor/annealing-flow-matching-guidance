@@ -1,9 +1,24 @@
-## Navigating with Annealing Guidance Scale in Diffusion Space (SIGGRAPH Asia 2025)
+## Porting "Navigating with Annealing Guidance Scale in Diffusion Space (SIGGRAPH Asia 2025)" to Flow Matching
 
 > **Shai Yehezkel\*, Omer Dahary\*, Andrey Voynov, Daniel Cohen-Or**
 >
 > Denoising diffusion models excel at generating high-quality images conditioned on text prompts, yet their effectiveness heavily relies on careful guidance during the sampling process. Classifier-Free Guidance (CFG) provides a widely used mechanism for steering generation by setting the guidance scale, which balances image quality and prompt alignment. However, the choice of the guidance scale has a critical impact on the convergence toward a visually appealing and prompt-adherent image. In this work, we propose an annealing guidance scheduler which dynamically adjusts the guidance scale over time based on the conditional noisy signal. By learning a scheduling policy, our method addresses the temperamental behavior of CFG. Empirical results demonstrate that our guidance scheduler significantly enhances image quality and alignment with the text prompt, advancing the performance of text-to-image generation. Notably, our novel scheduler requires no additional activations or memory consumption, and can seamlessly replace the common classifier-free guidance, offering an improved trade-off between prompt alignment and quality.
 
+## Results in Flow Matching: FID vs. CLIP (SD3-medium, 20 steps, 1000 COCO val2017 prompts)
+
+Annealing guidance (ours) dominates the FID/CLIP Pareto frontier against CFG,
+APG, and CFG++, across two δ-norm training schedules (fixed `d_max=5` and
+EMA-p95) and with FSG (Fixed-point Stochastic Guidance) at inference.
+
+<p align="center">
+<a href="assets/fid_vs_clip.pdf"><img src="assets/fid_vs_clip.png" width="760px"/></a>
+</p>
+
+<sub>Vector-graphics [PDF](assets/fid_vs_clip.pdf). Regenerate with
+`python scripts/plot_fid_vs_clip.py` (reads the two `metrics_table.csv`
+files under `results/final/a5000/`).</sub>
+
+## Background on Annealing Guidance:
 <a href="https://annealing-guidance.github.io/annealing-guidance/"><img src="https://img.shields.io/static/v1?label=Project&message=Website&color=red" height=20.5></a> 
 <a href="https://arxiv.org/abs/2506.24108"><img src="https://img.shields.io/badge/arXiv-Annealing-b31b1b.svg" height=20.5></a>
 
@@ -17,6 +32,7 @@ We train a guidance scale model that predicts the optimal guidance scale at each
 <p align="center">
 <img src="assets/alg_ours.jpg" width="800px"/>
 </p>
+
 
 
 ## Environment Setup
