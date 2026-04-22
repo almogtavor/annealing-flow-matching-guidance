@@ -307,6 +307,103 @@ def forward_pass_sd3(
     }
 
 
+def forward_pass_sc(
+    config,
+    pipeline,
+    model,
+    images,
+    prompts,
+    image_paths=None,
+):
+    """L2 self-consistency objective (arXiv:2510.00815v1), flow-matching adaptation.
+
+    Sample continuous (sigma_s, sigma_t) with a training gap >= delta_gap (0.1 default),
+    noise x_0 with a SHARED eps to both sigma_t (z_t) and sigma_s (z_s_true),
+    run one guided Euler step z_t -> z_s_pred, and minimize ||z_s_pred - z_s_true||^2.
+    """
+    import torch.nn.functional as F
+
+    B = images.size(0)
+    dtype = pipeline.transformer.dtype
+    device = pipeline.device
+
+    sc = config['training'].get('sc', {})
+    delta_gap = float(sc.get('delta_gap', 0.1))
+    sigma_min = float(sc.get('sigma_min', 0.0))
+    sigma_max = float(sc.get('sigma_max', 0.99))
+
+    # Continuous (sigma_s, sigma_t) with sigma_t - sigma_s >= delta_gap.
+    span_s = max(sigma_max - delta_gap - sigma_min, 1e-6)
+    u = torch.rand(B, device=device)
+    sigma_s = sigma_min + u * span_s
+    span_t = torch.clamp(sigma_max - sigma_s - delta_gap, min=0.0)
+    v = torch.rand(B, device=device)
+    sigma_t = sigma_s + delta_gap + v * span_t
+    sigma_s = sigma_s.clamp(0.0, sigma_max - delta_gap)
+    sigma_t = torch.maximum(sigma_t, sigma_s + delta_gap).clamp(max=sigma_max)
+
+    # SD3 transformer expects int timesteps in [0, 1000].
+    t_step = (sigma_t * 1000.0).round().to(torch.long).clamp(1, 999)
+
+    # VAE encode x_0 in fp32 (mirror to_noisy_latents_sd3).
+    with torch.no_grad():
+        vae = pipeline.vae.to(torch.float32)
+        img = images.to(device=vae.device, dtype=vae.dtype)
+        img = F.interpolate(img, size=(1024, 1024), mode='bilinear')
+        latents = vae.encode(img).latent_dist.sample()
+        latents = (latents - vae.config.shift_factor) * vae.config.scaling_factor
+    latents = latents.to(dtype=dtype)
+
+    # Shared noise -> z_t and true z_s.
+    eps = torch.randn_like(latents)
+    st = sigma_t.to(dtype=dtype).view(-1, 1, 1, 1)
+    ss = sigma_s.to(dtype=dtype).view(-1, 1, 1, 1)
+    z_t = (1 - st) * latents + st * eps
+    z_s_true = ((1 - ss) * latents + ss * eps).float()
+
+    # Prompt embeddings (no CADS for self-consistency training).
+    cache_dir = config['training'].get('prompt_cache_dir')
+    if cache_dir and image_paths:
+        pe, ppe = train_utils_sd3.load_cached_prompt_sd3(
+            cache_dir, config['training']['image_root'], image_paths, device)
+    else:
+        with torch.no_grad():
+            pe, ppe = train_utils_sd3.encode_prompt_sd3(pipeline, prompts)
+    # Note: ppe is [uncond; cond] (doubled); c_emb is the cond half.
+    # Keep c_emb in fp32 for the MLP; cast prompts to transformer dtype for the transformer call.
+    c_emb = ppe[ppe.shape[0] // 2:].float()
+    pe = pe.to(dtype=dtype)
+    ppe = ppe.to(dtype=dtype)
+
+    # Frozen transformer at t.
+    with torch.no_grad():
+        pred = train_utils_sd3.denoise_single_step_sd3(pipeline, z_t, pe, ppe, t_step)
+    vu, vt = pred.float().chunk(2)
+    del pred
+
+    lam = torch.rand(B, device=device)
+    fixed_lam = config['training'].get('fixed_lambda')
+    if fixed_lam is not None:
+        lam = torch.full_like(lam, fixed_lam)
+
+    interval_norm = (sigma_t - sigma_s).float()  # already in [0, 1]
+    w = model(t_step.float(), lam, vu, vt, interval=interval_norm, c_emb=c_emb).view(-1, 1, 1, 1)
+
+    v_guided = vu + w * (vt - vu)
+    # One guided Euler step from t -> s in flow-matching parameterization.
+    z_s_pred = z_t.float() - (st.float() - ss.float()) * v_guided
+
+    loss = ((z_s_pred - z_s_true) ** 2).mean()
+
+    return {
+        'loss': loss,
+        'train/w_mean': w.detach().mean().item(),
+        'train/w_std': w.detach().std(unbiased=False).item() if w.numel() > 1 else 0.0,
+        'train/sigma_t_mean': sigma_t.mean().item(),
+        'train/sigma_gap_mean': (sigma_t - sigma_s).mean().item(),
+    }
+
+
 if not torch.cuda.is_available():
     print("FATAL: CUDA not available. Refusing to run on CPU.")
     sys.exit(1)
@@ -350,7 +447,11 @@ print(f"Dataloader ready: {len(dataloader)} batches/epoch", flush=True)
 
 resume_step = resume_utils.maybe_resume(config, guidance_scale_network, optimizer)
 
-if is_sd3 and config.get('fsg', {}).get('enabled', False):
+_objective = config.get('training', {}).get('objective')
+if is_sd3 and _objective == 'sc_l2':
+    forward_fn = forward_pass_sc
+    print("Self-consistency L2 objective enabled (arXiv:2510.00815v1)", flush=True)
+elif is_sd3 and config.get('fsg', {}).get('enabled', False):
     from src.utils.fsg_utils import forward_pass_fsg
     forward_fn = forward_pass_fsg
     print("FSG training enabled", flush=True)

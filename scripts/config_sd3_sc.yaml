@@ -1,0 +1,59 @@
+seed: 42
+diffusion:
+  model_id: stabilityai/stable-diffusion-3-medium-diffusers
+  num_sampling_steps: 20
+  vanilla_cfg: 0
+  scheduler_kwargs:
+    beta_start: 0.00085
+    beta_end: 0.012
+    beta_schedule: scaled_linear
+    clip_sample: false
+    set_alpha_to_one: true
+    pred_sample_direction_with_null: true
+
+guidance_scale_model:
+  type: scalar_mlp
+  hidden_size: 128
+  output_size: 1
+  n_layers: 3
+  noise_metric: norm
+  lambda_embed_dim: 4
+  delta_embed_dim: 4
+  t_embed_dim: 4
+  interval_embed_dim: 4
+  c_embed_dim: 64
+  c_input_dim: 2048
+  delta_embed_normalization: 5.0
+  t_embed_normalization: 1000
+  w_nonneg: softplus
+  w_scale: 1
+  w_bias: 0
+
+fsg:
+  enabled: false
+
+training:
+  label: sc_l2_gap010
+  objective: sc_l2
+  save_interval: 200
+  max_images: 20000
+  batch_size: 1
+  accumulation_steps: 8
+  out_dir: ./output
+  image_root: src/data/laion/laion_pop_images/
+  prompt_cache_dir: /home/ML_courses/03683533_2025/or_tal_almog/almog/prompt_cache/
+  ema_loss_normalization: false
+  optimizer_kwargs:
+    weight_decay: 0.01
+    lr: 5.0e-4
+  prompt_noise:
+    add_noise: false
+    noise_scale: 0
+    rescale: false
+    psi: 1
+    t1: 0
+    t2: 1
+  sc:
+    delta_gap: 0.1
+    sigma_min: 0.0
+    sigma_max: 0.99

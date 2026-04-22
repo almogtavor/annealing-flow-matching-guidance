@@ -72,6 +72,7 @@ class ScalarMLP(nn.Module):
 
         self.w_bias = w_bias
         self.w_scale = w_scale
+        self.w_nonneg = kwargs.get('w_nonneg')
 
     # ---------- helpers ----------
 
@@ -160,7 +161,10 @@ class ScalarMLP(nn.Module):
 
         # 4) Head → scales
         guidance_scale = self.combined_head(features)                   # (B, output_size)
-        guidance_scale = self.w_scale * guidance_scale + self.w_bias
+        if self.w_nonneg == 'softplus':
+            guidance_scale = torch.nn.functional.softplus(guidance_scale) + 1e-3
+        else:
+            guidance_scale = self.w_scale * guidance_scale + self.w_bias
 
         # Squeeze to (B,) for single-output models
         if guidance_scale.shape[1] == 1:

@@ -197,7 +197,7 @@ def run_auto_sample(config):
         ckpt_id = f"sd3_{lr}_{label}" if label else f"sd3_lr{lr}"
     else:
         ckpt_id = os.path.basename(os.path.dirname(latest))
-    script = os.path.join(repo, "submit_sd3_sample.sh")
+    script = os.path.join(repo, "slurm", "sample", "submit_sd3_sample.sh")
     os.makedirs(os.path.join(repo, "logs", "sampling"), exist_ok=True)
     print(f"\n{'='*60}\nSUBMITTING SAMPLING JOB: {ckpt_id}\n{'='*60}\n", flush=True)
     export_vars = f"ALL,SD3_SAMPLE_CHECKPOINT={latest},SD3_SAMPLE_CHECKPOINT_ID={ckpt_id}"
@@ -211,7 +211,7 @@ def run_auto_sample(config):
         print(f"sbatch failed: {result.stderr.strip()}", flush=True)
 
     # Also submit fig2 comparison job
-    fig2_script = os.path.join(repo, "submit_sd3_sampling_woman_black_dress.sh")
+    fig2_script = os.path.join(repo, "slurm", "sample", "submit_sd3_sampling_woman_black_dress.sh")
     if os.path.exists(fig2_script):
         print(f"\n{'='*60}\nSUBMITTING FIG2 COMPARISON JOB\n{'='*60}\n", flush=True)
         fig2_vars = f"ALL,FIG2_CHECKPOINT={latest}"
